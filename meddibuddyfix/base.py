@@ -341,16 +341,19 @@ class Settings(BaseSettings):
     default_chat_model_id: str = ""
     """UUID of the registry model used when no model and no agent is selected and intent is general_chat.
     If empty, requests without a model or agent will return 400."""
-    image_gen_model_id: str = ""
-    """UUID of the registry model for image generation (DALL-E or Gemini).
-    The handler auto-detects the provider from the registry entry:
-    - provider=openai + dall-e model → OpenAI DALL-E API
-    - provider=azure + dall-e model  → Azure OpenAI DALL-E API
-    - provider=google / gemini model → Nano Banana (Vertex AI Gemini)"""
+    # Image Generation (from model registry — identified by display name)
+    image_gen_model_name: str = ""
+    """Display name of the image generation model in the registry (e.g. 'Nano Banana', 'dall-e-3').
+    The handler searches the registry by this name and uses the model's credentials."""
     image_gen_rate_limit: int = 10
     """Maximum image generation requests per user per time window."""
     image_gen_rate_window: int = 3600
     """Time window in seconds for image generation rate limiting (default: 1 hour)."""
+
+    # Web Search (from model registry — identified by display name)
+    web_search_model_name: str = ""
+    """Display name of the web search model in the registry (e.g. 'Web Search', 'Gemini Web Search').
+    Must be a Google model with API key. Uses GoogleSearch grounding tool."""
 
     # Company Knowledge Base (Azure AI Agent — same as MiBuddy Motherson search)
     azure_ai_project_endpoint: str = ""
