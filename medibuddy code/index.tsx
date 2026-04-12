@@ -423,6 +423,11 @@ export default function AgentOrchestrator() {
   const [isCanvasEnabled, setIsCanvasEnabled] = useState(false);
   const [canvasEditingId, setCanvasEditingId] = useState<string | null>(null);
   const [canvasEditTexts, setCanvasEditTexts] = useState<Record<string, string>>({});
+  // Addon: Autocomplete suggestions
+  const [suggestions, setSuggestions] = useState<string[]>([]);
+  const [showSuggestions, setShowSuggestions] = useState(false);
+  const [selectedSuggestionIdx, setSelectedSuggestionIdx] = useState(-1);
+  const suggestionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Addon: Speech-to-Text (mic)
   const [isListening, setIsListening] = useState(false);
   const recognitionRef = useRef<any>(null);
@@ -766,6 +771,10 @@ export default function AgentOrchestrator() {
       if (!(e.target as Element)?.closest?.("[data-chat-menu]")) {
         setChatMenuOpenId(null);
       }
+      // Close suggestions when clicking outside input area
+      if (!(e.target as Element)?.closest?.("textarea")) {
+        setShowSuggestions(false);
+      }
     };
     document.addEventListener("mousedown", handleClickOutside);
     return () => document.removeEventListener("mousedown", handleClickOutside);
@@ -890,6 +899,37 @@ export default function AgentOrchestrator() {
     } else {
       setShowMentions(false);
     }
+
+    // Autocomplete suggestions — debounced fetch
+    if (suggestionTimerRef.current) clearTimeout(suggestionTimerRef.current);
+    setSelectedSuggestionIdx(-1);
+    if (value.trim().length < 2) {
+      setSuggestions([]);
+      setShowSuggestions(false);
+      return;
+    }
+    suggestionTimerRef.current = setTimeout(() => {
+      const suggestUrl = `${getURL("ORCHESTRATOR")}/suggestions?q=${encodeURIComponent(value.trim())}`;
+      const headers: Record<string, string> = {};
+      const tokenMatch = document.cookie.match(/(?:^|;\s*)access_token_lf=([^;]*)/);
+      if (tokenMatch?.[1]) headers["Authorization"] = `Bearer ${decodeURIComponent(tokenMatch[1])}`;
+      fetch(suggestUrl, { headers, credentials: "include" })
+        .then((r) => r.ok ? r.json() : null)
+        .then((data) => {
+          const items: string[] = data?.suggestions || [];
+          setSuggestions(items);
+          setShowSuggestions(items.length > 0);
+        })
+        .catch(() => { setSuggestions([]); setShowSuggestions(false); });
+    }, 400);
+  };
+
+  const handleSelectSuggestion = (text: string) => {
+    setInput(text);
+    setSuggestions([]);
+    setShowSuggestions(false);
+    setSelectedSuggestionIdx(-1);
+    textareaRef.current?.focus();
   };
 
   const handleSelectAgent = (agent: Agent) => {
@@ -2303,6 +2343,25 @@ export default function AgentOrchestrator() {
                   ))}
                 </div>
               )}
+              {/* Autocomplete suggestions dropdown */}
+              {showSuggestions && suggestions.length > 0 && (
+                <div className="border-b border-border px-2 py-1.5">
+                  {suggestions.map((s, i) => (
+                    <button
+                      key={i}
+                      onClick={() => handleSelectSuggestion(s)}
+                      className={`flex w-full items-center gap-2 rounded-md px-3 py-1.5 text-left text-sm transition-colors ${
+                        i === selectedSuggestionIdx
+                          ? "bg-accent text-foreground"
+                          : "text-muted-foreground hover:bg-accent hover:text-foreground"
+                      }`}
+                    >
+                      <Search size={12} className="shrink-0 opacity-50" />
+                      <span className="truncate">{s}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
               <textarea
                 ref={textareaRef}
                 value={input}
@@ -2310,8 +2369,32 @@ export default function AgentOrchestrator() {
                 onPaste={handlePaste}
                 disabled={isSending || !canInteract}
                 onKeyDown={(e) => {
+                  // Suggestion keyboard navigation
+                  if (showSuggestions && suggestions.length > 0) {
+                    if (e.key === "ArrowDown") {
+                      e.preventDefault();
+                      setSelectedSuggestionIdx((prev) => (prev + 1) % suggestions.length);
+                      return;
+                    }
+                    if (e.key === "ArrowUp") {
+                      e.preventDefault();
+                      setSelectedSuggestionIdx((prev) => (prev <= 0 ? suggestions.length - 1 : prev - 1));
+                      return;
+                    }
+                    if (e.key === "Enter" && !e.shiftKey && selectedSuggestionIdx >= 0) {
+                      e.preventDefault();
+                      handleSelectSuggestion(suggestions[selectedSuggestionIdx]);
+                      return;
+                    }
+                    if (e.key === "Escape") {
+                      setSuggestions([]);
+                      setShowSuggestions(false);
+                      return;
+                    }
+                  }
                   if (e.key === "Enter" && !e.shiftKey) {
                     e.preventDefault();
+                    setSuggestions([]); setShowSuggestions(false);
                     handleSend();
                   }
                 }}
