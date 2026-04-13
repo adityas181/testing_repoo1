@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from io import BytesIO
+from pathlib import Path
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any
@@ -13,7 +15,7 @@ _request_base_url: ContextVar[str | None] = ContextVar("_request_base_url", defa
 
 import httpx
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, UploadFile, status
 
 from loguru import logger
 from pydantic import BaseModel
@@ -47,6 +49,7 @@ from agentcore.services.database.models.user.model import User
 from agentcore.services.database.models.orch_conversation.model import OrchConversationTable
 from agentcore.services.database.models.orch_conversation.crud import (
     orch_add_message,
+    orch_archive_session,
     orch_delete_session,
     orch_get_active_agent,
     orch_get_messages,
@@ -139,10 +142,13 @@ class OrchChatRequest(BaseModel):
     session_id: str
     agent_id: UUID | None = None
     deployment_id: UUID | None = None
+    model_id: UUID | None = None  # selected model from registry (for direct model chat)
     input_value: str
     version_number: int | None = None
     env: str | None = None  # "uat" or "prod"
     files: list[str] | None = None
+    enable_reasoning: bool = False  # enable CoT reasoning if model supports it
+    image_mode: bool = False  # explicit image-generation mode (fast path, skips intent classification)
 
 
 class OrchMessageResponse(BaseModel):
@@ -154,6 +160,9 @@ class OrchMessageResponse(BaseModel):
     text: str
     agent_id: UUID | None = None
     deployment_id: UUID | None = None
+    model_id: UUID | None = None
+    model_name: str | None = None
+    reasoning_content: str | None = None
     category: str = "message"
     files: list[str] | None = None
     properties: dict | None = None
@@ -167,6 +176,16 @@ class OrchChatResponse(BaseModel):
     context_reset: bool = False
 
 
+class OrchModelSummary(BaseModel):
+    model_id: UUID
+    display_name: str
+    provider: str
+    model_name: str
+    model_type: str = "llm"
+    capabilities: dict | None = None
+    is_default: bool = False
+
+
 class OrchSessionSummary(BaseModel):
     session_id: str
     last_timestamp: str | None = None
@@ -174,6 +193,7 @@ class OrchSessionSummary(BaseModel):
     active_agent_id: UUID | None = None
     active_deployment_id: UUID | None = None
     active_agent_name: str | None = None
+    is_archived: bool = False
 
 
 
@@ -935,6 +955,274 @@ async def list_orch_agents(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+# ---------------------------------------------------------------------------
+# Intent-based routing helpers
+# ---------------------------------------------------------------------------
+
+async def _get_model_display_name(session: DbSession, model_id: UUID) -> str:
+    """Look up the display_name of a registry model."""
+    from agentcore.services.database.models.model_registry.model import ModelRegistry
+    row = await session.get(ModelRegistry, model_id)
+    if row:
+        return row.display_name
+    return "Model"
+
+
+async def _route_request(
+    session: DbSession,
+    current_user: CurrentActiveUser,
+    body: OrchChatRequest,
+) -> dict:
+    """Determine routing mode for a chat request.
+
+    Returns dict with:
+      mode: "agent" | "model_direct" | "web_search" | "image_gen" | "document_qa"
+      agent_id, deployment_id, deployment: for agent mode
+      model_id: for model_direct mode
+      intent: classified intent string
+      doc_files: list of document file paths (for document_qa mode)
+      image_files: list of image file paths
+    """
+    from agentcore.services.mibuddy.document_extractor import IMAGE_EXTENSIONS, SUPPORTED_DOC_EXTENSIONS
+
+    # Priority 0: Document files attached → document_qa mode (highest priority)
+    if body.files:
+        doc_files = [
+            f for f in body.files
+            if Path(f).suffix.lower() in SUPPORTED_DOC_EXTENSIONS
+        ]
+        image_files = [
+            f for f in body.files
+            if Path(f).suffix.lower() in IMAGE_EXTENSIONS
+        ]
+        if doc_files:
+            model_id = body.model_id
+            if not model_id:
+                settings = get_settings_service()
+                default_id = settings.settings.default_chat_model_id
+                if default_id:
+                    model_id = UUID(default_id)
+            return {
+                "mode": "document_qa",
+                "agent_id": None,
+                "deployment_id": None,
+                "deployment": None,
+                "model_id": model_id,
+                "intent": "document_processing",
+                "doc_files": doc_files,
+                "image_files": image_files,
+            }
+
+    # Priority 0.5: User explicitly selected a special model (Web Search, Nano Banana)
+    # Force that mode regardless of intent classification
+    if body.model_id and not body.agent_id and not body.deployment_id:
+        try:
+            from agentcore.services.mibuddy.model_capabilities import detect_capabilities
+            from agentcore.services.database.models.model_registry.model import ModelRegistry
+
+            selected_model = await session.get(ModelRegistry, body.model_id)
+            if selected_model:
+                caps = detect_capabilities(
+                    selected_model.provider,
+                    selected_model.model_name,
+                    selected_model.capabilities,
+                )
+                # If user selected a web_search model → force web search
+                if caps.get("web_search"):
+                    logger.info(f"[ORCH] User selected web search model: {selected_model.display_name}")
+                    return {
+                        "mode": "web_search",
+                        "agent_id": None,
+                        "deployment_id": None,
+                        "deployment": None,
+                        "model_id": body.model_id,
+                        "intent": "web_search_explicit",
+                    }
+                # If user selected an image gen model → force image generation
+                if caps.get("image_generation"):
+                    logger.info(f"[ORCH] User selected image gen model: {selected_model.display_name}")
+                    return {
+                        "mode": "image_gen",
+                        "agent_id": None,
+                        "deployment_id": None,
+                        "deployment": None,
+                        "model_id": body.model_id,
+                        "intent": "image_generation_explicit",
+                    }
+        except Exception as e:
+            logger.debug(f"[ORCH] Model capability check failed (non-critical): {e}")
+
+    # Mode 1: Explicit @agent mention
+    if body.agent_id or body.deployment_id:
+        agent_id, deployment_id, deployment = await _resolve_agent(session, current_user, body)
+        return {
+            "mode": "agent",
+            "agent_id": agent_id,
+            "deployment_id": deployment_id,
+            "deployment": deployment,
+            "model_id": None,
+            "intent": None,
+        }
+
+    # Fast path: explicit image_mode flag from frontend — skip intent classification
+    if body.image_mode:
+        logger.info(f"[ORCH] image_mode=true, routing directly to image_gen")
+        return {
+            "mode": "image_gen",
+            "agent_id": None,
+            "deployment_id": None,
+            "deployment": None,
+            "model_id": body.model_id,
+            "intent": "image_generation",
+        }
+
+    # Mode 2/3: No @agent — run intent classification
+    from agentcore.services.mibuddy.intent_classifier import IntentClassifier, Intent
+
+    classifier = IntentClassifier()
+    intent = await classifier.classify(body.input_value)
+    logger.info(f"[ORCH] Intent classified: {intent.value} for input: {body.input_value[:80]!r}")
+
+    if intent == Intent.KNOWLEDGE_BASE_SEARCH:
+        return {
+            "mode": "kb_search",
+            "agent_id": None,
+            "deployment_id": None,
+            "deployment": None,
+            "model_id": body.model_id,
+            "intent": intent.value,
+        }
+
+    if intent == Intent.WEB_SEARCH:
+        return {
+            "mode": "web_search",
+            "agent_id": None,
+            "deployment_id": None,
+            "deployment": None,
+            "model_id": body.model_id,
+            "intent": intent.value,
+        }
+
+    if intent == Intent.IMAGE_GENERATION:
+        return {
+            "mode": "image_gen",
+            "agent_id": None,
+            "deployment_id": None,
+            "deployment": None,
+            "model_id": body.model_id,
+            "intent": intent.value,
+        }
+
+    # Intent is general_chat
+    # Check if session has documents in Pinecone (follow-up question about uploaded docs)
+    try:
+        from agentcore.services.mibuddy.document_processor import session_has_documents
+        if await session_has_documents(body.session_id):
+            logger.info(f"[ORCH] Session has documents in Pinecone — routing to document_qa for follow-up")
+            model_id = body.model_id
+            if not model_id:
+                settings = get_settings_service()
+                default_id = settings.settings.default_chat_model_id
+                if default_id:
+                    model_id = UUID(default_id)
+            return {
+                "mode": "document_qa",
+                "agent_id": None,
+                "deployment_id": None,
+                "deployment": None,
+                "model_id": model_id,
+                "intent": "document_followup",
+                "doc_files": [],
+                "image_files": [],
+            }
+    except Exception as e:
+        logger.debug(f"[ORCH] Document session check failed (non-critical): {e}")
+
+    # Check if user selected the default/smart-router model — auto-pick best model
+    if body.model_id:
+        settings_svc = get_settings_service().settings
+        default_name = (settings_svc.default_orch_model_name or "").strip().lower()
+        if default_name and settings_svc.smart_router_enabled:
+            # Look up the selected model's display name from registry
+            is_default_model = False
+            try:
+                from agentcore.services.model_service_client import fetch_registry_models_async
+                all_models = await fetch_registry_models_async(model_type="llm", active_only=True)
+                for m in (all_models or []):
+                    if str(m.get("id", "")) == str(body.model_id):
+                        if (m.get("display_name", "")).strip().lower() == default_name:
+                            is_default_model = True
+                        break
+            except Exception:
+                pass
+
+            if is_default_model:
+                from agentcore.services.mibuddy.smart_router import route_to_best_model
+                logger.info(f"[ORCH] Default model (smart router): analyzing query to pick best model")
+                routed = await route_to_best_model(body.input_value)
+                if routed:
+                    routed_id, routed_name = routed
+                    logger.info(f"[ORCH] Smart router selected: {routed_name}")
+                    return {
+                        "mode": "model_direct",
+                        "agent_id": None,
+                        "deployment_id": None,
+                        "deployment": None,
+                        "model_id": UUID(routed_id),
+                        "intent": "smart_router",
+                        "routed_model_name": routed_name,
+                    }
+                else:
+                    logger.warning("[ORCH] Smart router failed, falling back to direct model chat")
+
+    # Check if user selected a model
+    if body.model_id:
+        return {
+            "mode": "model_direct",
+            "agent_id": None,
+            "deployment_id": None,
+            "deployment": None,
+            "model_id": body.model_id,
+            "intent": intent.value,
+        }
+
+    # Check sticky session
+    active = await orch_get_active_agent(session, body.session_id)
+    if active:
+        agent_id = active["agent_id"]
+        deployment_id = active["deployment_id"]
+        deployment = await session.get(AgentDeploymentProd, deployment_id)
+        if not deployment:
+            deployment = await session.get(AgentDeploymentUAT, deployment_id)
+        if deployment:
+            return {
+                "mode": "agent",
+                "agent_id": agent_id,
+                "deployment_id": deployment_id,
+                "deployment": deployment,
+                "model_id": None,
+                "intent": intent.value,
+            }
+
+    # Check default model
+    settings = get_settings_service()
+    default_model_id = settings.settings.default_chat_model_id
+    if default_model_id:
+        return {
+            "mode": "model_direct",
+            "agent_id": None,
+            "deployment_id": None,
+            "deployment": None,
+            "model_id": UUID(default_model_id),
+            "intent": intent.value,
+        }
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="No agent specified, no model selected, and no default model configured. "
+               "Mention an agent with @ or select a model to start.",
+    )
+
 
 @router.post(
     "/chat",
@@ -949,34 +1237,115 @@ async def orch_chat(
     current_user: CurrentActiveUser,
     body: OrchChatRequest,
 ):
-    """Send a user message to a deployed agent and return the agent's reply.
+    """Send a user message to a deployed agent or model and return the reply.
 
-    Sticky routing: if agent_id/deployment_id are omitted, the message is
-    routed to the last active agent in the session.
-
-    Context reset: when the agent changes mid-session, a system message is
-    inserted as a divider and the new agent starts with a fresh context.
+    Routing modes:
+    1. @agent mention (agent_id/deployment_id) -> existing agent flow
+    2. No @agent -> intent classification -> web_search / image_gen / general_chat
+    3. general_chat + model_id -> direct model call
+    4. general_chat + sticky session -> existing agent flow
+    5. general_chat + default_chat_model_id -> direct model call
     """
     _request_base_url.set(str(request.base_url).rstrip("/"))
     try:
-        # -- 1. Resolve agent (sticky routing) -----------------------------
-        agent_id, deployment_id, deployment = await _resolve_agent(
-            session,
-            current_user,
-            body,
-        )
+        # -- 1. Route request ------------------------------------------------
+        routing = await _route_request(session, current_user, body)
+        mode = routing["mode"]
+        logger.info(f"[ORCH] Routing mode={mode} intent={routing.get('intent')} session={body.session_id}")
 
-        # -- 2. Context reset if agent switched ----------------------------
-        did_reset = await _maybe_context_reset(
-            session,
-            session_id=body.session_id,
-            new_agent_id=agent_id,
-            new_agent_name=deployment.agent_name,
-            user_id=current_user.id,
-            new_deployment_id=deployment_id,
-        )
+        # -- 2. Handle agent mode (existing flow) ----------------------------
+        if mode == "agent":
+            agent_id = routing["agent_id"]
+            deployment_id = routing["deployment_id"]
+            deployment = routing["deployment"]
 
-        # -- 3. Persist user message ---------------------------------------
+            did_reset = await _maybe_context_reset(
+                session,
+                session_id=body.session_id,
+                new_agent_id=agent_id,
+                new_agent_name=deployment.agent_name,
+                user_id=current_user.id,
+                new_deployment_id=deployment_id,
+            )
+
+            msg_ts = datetime.now(timezone.utc).replace(tzinfo=None)
+            user_msg = OrchConversationTable(
+                id=uuid4(),
+                sender="user",
+                sender_name=current_user.username or "User",
+                session_id=body.session_id,
+                text=body.input_value,
+                agent_id=agent_id,
+                user_id=current_user.id,
+                deployment_id=deployment_id,
+                timestamp=msg_ts,
+                files=body.files or [],
+                properties={},
+                category="message",
+                content_blocks=[],
+            )
+            await orch_add_message(user_msg, session)
+
+            logger.info(f"[ORCH] Agent={deployment.agent_name} | session={body.session_id}")
+            _env_str = "2" if isinstance(deployment, AgentDeploymentProd) else "1"
+            _version_str = f"v{deployment.version_number}"
+            agent_text, _was_hitl, agent_content_blocks = await _orch_call_run_api(
+                agent_id=str(agent_id),
+                env=_env_str,
+                version=_version_str,
+                input_value=body.input_value,
+                session_id=body.session_id,
+                files=body.files,
+                orch_deployment_id=str(deployment_id) if deployment_id else None,
+                orch_session_id=body.session_id,
+                orch_org_id=str(deployment.org_id) if deployment.org_id else None,
+                orch_dept_id=str(deployment.dept_id) if deployment.dept_id else None,
+                orch_user_id=str(current_user.id),
+                user_id=str(current_user.id),
+            )
+
+            if not agent_text or not agent_text.strip():
+                agent_text = "Agent did not produce a response."
+
+            serialized_blocks = _serialize_content_blocks(agent_content_blocks)
+
+            reply_ts = datetime.now(timezone.utc).replace(tzinfo=None)
+            agent_msg = OrchConversationTable(
+                id=uuid4(),
+                sender="agent",
+                sender_name=deployment.agent_name,
+                session_id=body.session_id,
+                text=agent_text,
+                agent_id=agent_id,
+                user_id=current_user.id,
+                deployment_id=deployment_id,
+                timestamp=reply_ts,
+                files=[],
+                properties={},
+                category="message",
+                content_blocks=serialized_blocks,
+            )
+            saved_agent_msg = await orch_add_message(agent_msg, session)
+
+            return OrchChatResponse(
+                session_id=body.session_id,
+                agent_name=deployment.agent_name,
+                context_reset=did_reset,
+                message=OrchMessageResponse(
+                    id=saved_agent_msg.id,
+                    timestamp=saved_agent_msg.timestamp.isoformat() if saved_agent_msg.timestamp else "",
+                    sender="agent",
+                    sender_name=deployment.agent_name,
+                    session_id=body.session_id,
+                    text=agent_text,
+                    agent_id=agent_id,
+                    deployment_id=deployment_id,
+                    content_blocks=serialized_blocks or None,
+                ),
+            )
+
+        # -- 3. Handle non-agent modes (model_direct, web_search, image_gen) --
+        # Persist user message (no agent_id)
         msg_ts = datetime.now(timezone.utc).replace(tzinfo=None)
         user_msg = OrchConversationTable(
             id=uuid4(),
@@ -984,9 +1353,8 @@ async def orch_chat(
             sender_name=current_user.username or "User",
             session_id=body.session_id,
             text=body.input_value,
-            agent_id=agent_id,
             user_id=current_user.id,
-            deployment_id=deployment_id,
+            model_id=routing.get("model_id"),
             timestamp=msg_ts,
             files=body.files or [],
             properties={},
@@ -995,64 +1363,120 @@ async def orch_chat(
         )
         await orch_add_message(user_msg, session)
 
-        # -- 4. Run the agent via /run API -----------------------------------
-        logger.info(f"[ORCH] Agent={deployment.agent_name} | session={body.session_id} | input_value={body.input_value!r}")
-        _env_str = "2" if isinstance(deployment, AgentDeploymentProd) else "1"
-        _version_str = f"v{deployment.version_number}"
-        agent_text, _was_hitl, agent_content_blocks = await _orch_call_run_api(
-            agent_id=str(agent_id),
-            env=_env_str,
-            version=_version_str,
-            input_value=body.input_value,
-            session_id=body.session_id,
-            files=body.files,
-            orch_deployment_id=str(deployment_id) if deployment_id else None,
-            orch_session_id=body.session_id,
-            orch_org_id=str(deployment.org_id) if deployment.org_id else None,
-            orch_dept_id=str(deployment.dept_id) if deployment.dept_id else None,
-            orch_user_id=str(current_user.id),
-            user_id=str(current_user.id),
-        )
+        response_text = ""
+        reasoning_content = None
+        sender_name = "Assistant"
+        resp_model_id = routing.get("model_id")
+        resp_model_name = None
 
-        if not agent_text or not agent_text.strip():
-            agent_text = "Agent did not produce a response."
+        if mode == "model_direct":
+            from agentcore.services.mibuddy.direct_model_chat import direct_model_chat
+            result = await direct_model_chat(
+                model_id=str(resp_model_id),
+                input_value=body.input_value,
+                session_id=body.session_id,
+                files=body.files,
+                enable_reasoning=body.enable_reasoning,
+            )
+            response_text = result["response_text"]
+            reasoning_content = result.get("reasoning_content")
+            resp_model_name = result.get("model_name", "")
+            sender_name = await _get_model_display_name(session, resp_model_id)
 
-        # Serialize content_blocks for storage
-        serialized_blocks = _serialize_content_blocks(agent_content_blocks)
+        elif mode == "kb_search":
+            from agentcore.services.mibuddy.kb_search_handler import handle_kb_search
+            result = await handle_kb_search(body.input_value)
+            response_text = result["response_text"]
+            resp_model_name = result.get("model_name", "knowledge-base")
+            settings = get_settings_service()
+            sender_name = settings.settings.company_kb_name or "Knowledge Base"
 
-        # -- 5. Persist agent reply ----------------------------------------
+        elif mode == "web_search":
+            from agentcore.services.mibuddy.web_search_handler import handle_web_search
+            from agentcore.services.mibuddy.system_prompts import get_system_identity_prompt
+            result = await handle_web_search(body.input_value, system_message=get_system_identity_prompt())
+            response_text = result["response_text"]
+            resp_model_name = result.get("model_name", "gemini")
+            sender_name = "Web Search"
+
+        elif mode == "image_gen":
+            from agentcore.services.mibuddy.image_gen_handler import handle_image_generation
+            result = await handle_image_generation(
+                body.input_value,
+                model_id=str(resp_model_id) if resp_model_id else None,
+                user_id=str(current_user.id),
+            )
+            response_text = result["response_text"]
+            resp_model_name = result.get("model_name", "image-generation")
+            sender_name = "Image Generator"
+
+        elif mode == "document_qa":
+            from agentcore.services.mibuddy.document_processor import process_and_ingest, search_documents, build_doc_qa_prompt
+            from agentcore.services.mibuddy.direct_model_chat import direct_model_chat
+
+            # Ingest new documents if attached
+            doc_files = routing.get("doc_files", [])
+            if doc_files:
+                count = await process_and_ingest(doc_files, body.session_id)
+                logger.info(f"[ORCH] Ingested {count} chunks from {len(doc_files)} files")
+                # Wait for Pinecone to index vectors (eventual consistency)
+                if count > 0:
+                    await asyncio.sleep(5)
+
+            # Search for relevant chunks
+            chunks = await search_documents(body.input_value, body.session_id)
+            logger.info(f"[ORCH] Document search returned {len(chunks)} chunks")
+
+            # Build enriched prompt and call model
+            enriched_prompt = build_doc_qa_prompt(body.input_value, chunks)
+            if not resp_model_id:
+                raise HTTPException(status_code=400, detail="No model selected for document Q&A.")
+            result = await direct_model_chat(
+                model_id=str(resp_model_id),
+                input_value=enriched_prompt,
+                session_id=body.session_id,
+            )
+            response_text = result["response_text"]
+            reasoning_content = result.get("reasoning_content")
+            resp_model_name = result.get("model_name", "")
+            sender_name = await _get_model_display_name(session, resp_model_id) if resp_model_id else "Document Q&A"
+
+        if not response_text or not response_text.strip():
+            response_text = "No response was generated. Please try again."
+
+        # Persist response
         reply_ts = datetime.now(timezone.utc).replace(tzinfo=None)
         agent_msg = OrchConversationTable(
             id=uuid4(),
             sender="agent",
-            sender_name=deployment.agent_name,
+            sender_name=sender_name,
             session_id=body.session_id,
-            text=agent_text,
-            agent_id=agent_id,
+            text=response_text,
             user_id=current_user.id,
-            deployment_id=deployment_id,
+            model_id=resp_model_id,
+            reasoning_content=reasoning_content,
             timestamp=reply_ts,
             files=[],
             properties={},
             category="message",
-            content_blocks=serialized_blocks,
+            content_blocks=[],
         )
-        saved_agent_msg = await orch_add_message(agent_msg, session)
+        saved_msg = await orch_add_message(agent_msg, session)
 
         return OrchChatResponse(
             session_id=body.session_id,
-            agent_name=deployment.agent_name,
-            context_reset=did_reset,
+            agent_name=sender_name,
+            context_reset=False,
             message=OrchMessageResponse(
-                id=saved_agent_msg.id,
-                timestamp=saved_agent_msg.timestamp.isoformat() if saved_agent_msg.timestamp else "",
+                id=saved_msg.id,
+                timestamp=saved_msg.timestamp.isoformat() if saved_msg.timestamp else "",
                 sender="agent",
-                sender_name=deployment.agent_name,
+                sender_name=sender_name,
                 session_id=body.session_id,
-                text=agent_text,
-                agent_id=agent_id,
-                deployment_id=deployment_id,
-                content_blocks=serialized_blocks or None,
+                text=response_text,
+                model_id=resp_model_id,
+                model_name=resp_model_name,
+                reasoning_content=reasoning_content,
             ),
         )
 
@@ -1075,24 +1499,200 @@ async def orch_chat_stream(
     current_user: CurrentActiveUser,
     body: OrchChatRequest,
 ):
-    """Stream agent response token-by-token as NDJSON events.
+    """Stream response token-by-token as NDJSON events.
 
-    Sticky routing + context reset apply here just like /chat.
+    Supports both agent-based and model-direct/web-search/image-gen streaming.
 
     Event types emitted:
       - ``add_message``  – first chunk (UI creates the message bubble)
       - ``token``        – subsequent chunks ``{chunk, id}``
+      - ``reasoning``    – CoT reasoning chunks (for models that support it)
       - ``end``          – signals stream is done, carries final ``{agent_text, message_id}``
     """
     _request_base_url.set(str(request.base_url).rstrip("/"))
-    # -- 1. Resolve agent (sticky routing) -------------------------------
-    agent_id, deployment_id, deployment = await _resolve_agent(
-        session,
-        current_user,
-        body,
-    )
 
-    # -- 2. Context reset if agent switched ------------------------------
+    # -- 1. Route request ------------------------------------------------
+    routing = await _route_request(session, current_user, body)
+    mode = routing["mode"]
+    logger.info(f"[ORCH-STREAM] Routing mode={mode} intent={routing.get('intent')} session={body.session_id}")
+
+    # -- 2. For non-agent modes, use direct streaming --------------------
+    if mode in ("model_direct", "web_search", "image_gen", "document_qa", "kb_search"):
+        # Persist user message
+        stream_msg_ts = datetime.now(timezone.utc).replace(tzinfo=None)
+        user_msg = OrchConversationTable(
+            id=uuid4(),
+            sender="user",
+            sender_name=current_user.username or "User",
+            session_id=body.session_id,
+            text=body.input_value,
+            user_id=current_user.id,
+            model_id=routing.get("model_id"),
+            timestamp=stream_msg_ts,
+            files=body.files or [],
+            properties={},
+            category="message",
+            content_blocks=[],
+        )
+        await orch_add_message(user_msg, session)
+
+        resp_model_id = routing.get("model_id")
+        sender_name = "Assistant"
+        if mode in ("model_direct", "document_qa") and resp_model_id:
+            sender_name = await _get_model_display_name(session, resp_model_id)
+        elif mode == "kb_search":
+            settings_svc = get_settings_service()
+            sender_name = settings_svc.settings.company_kb_name or "Knowledge Base"
+        elif mode == "web_search":
+            sender_name = "Web Search"
+        elif mode == "image_gen":
+            sender_name = "Image Generator"
+
+        queue: asyncio.Queue = asyncio.Queue()
+        event_manager = create_default_event_manager(queue)
+        _input_value = body.input_value
+        _session_id = body.session_id
+        _user_id = current_user.id
+        _enable_reasoning = body.enable_reasoning
+        _sender_name = sender_name
+        _resp_model_id = resp_model_id
+        _mode = mode
+        _files = body.files
+        _doc_files = routing.get("doc_files", [])
+
+        async def _run_direct_and_persist():
+            try:
+                result = {}
+                if _mode == "kb_search":
+                    from agentcore.services.mibuddy.kb_search_handler import handle_kb_search_stream
+                    result = await handle_kb_search_stream(
+                        _input_value,
+                        event_manager=event_manager,
+                    )
+                elif _mode == "document_qa":
+                    from agentcore.services.mibuddy.document_processor import process_and_ingest, search_documents, build_doc_qa_prompt
+                    from agentcore.services.mibuddy.direct_model_chat import direct_model_chat_stream
+
+                    # Ingest new documents — show progress to user
+                    if _doc_files:
+                        event_manager.on_token(data={"chunk": "📄 Processing document... "})
+                        count = await process_and_ingest(_doc_files, _session_id)
+                        logger.info(f"[ORCH-STREAM] Ingested {count} chunks from {len(_doc_files)} files")
+                        if count > 0:
+                            event_manager.on_token(data={"chunk": f"✅ Indexed {count} chunks. "})
+                            event_manager.on_token(data={"chunk": "🔍 Searching... "})
+                            await asyncio.sleep(5)
+                        else:
+                            event_manager.on_token(data={"chunk": "⚠️ No content extracted. "})
+                    else:
+                        event_manager.on_token(data={"chunk": "🔍 Searching documents... "})
+
+                    # Search + build enriched prompt
+                    chunks = await search_documents(_input_value, _session_id)
+                    logger.info(f"[ORCH-STREAM] Document search returned {len(chunks)} chunks")
+
+                    if chunks:
+                        event_manager.on_token(data={"chunk": f"Found {len(chunks)} relevant sections.\n\n"})
+                    else:
+                        event_manager.on_token(data={"chunk": "No relevant sections found.\n\n"})
+
+                    enriched_prompt = build_doc_qa_prompt(_input_value, chunks)
+
+                    result = await direct_model_chat_stream(
+                        model_id=str(_resp_model_id),
+                        input_value=enriched_prompt,
+                        session_id=_session_id,
+                        event_manager=event_manager,
+                    )
+                elif _mode == "model_direct":
+                    from agentcore.services.mibuddy.direct_model_chat import direct_model_chat_stream
+                    result = await direct_model_chat_stream(
+                        model_id=str(_resp_model_id),
+                        input_value=_input_value,
+                        session_id=_session_id,
+                        files=_files,
+                        enable_reasoning=_enable_reasoning,
+                        event_manager=event_manager,
+                    )
+                elif _mode == "web_search":
+                    from agentcore.services.mibuddy.web_search_handler import handle_web_search_stream
+                    from agentcore.services.mibuddy.system_prompts import get_system_identity_prompt
+                    result = await handle_web_search_stream(
+                        _input_value,
+                        system_message=get_system_identity_prompt(),
+                        event_manager=event_manager,
+                    )
+                elif _mode == "image_gen":
+                    from agentcore.services.mibuddy.image_gen_handler import handle_image_generation_stream
+                    result = await handle_image_generation_stream(
+                        _input_value,
+                        model_id=str(_resp_model_id) if _resp_model_id else None,
+                        user_id=str(_user_id),
+                        event_manager=event_manager,
+                    )
+
+                response_text = result.get("response_text", "")
+                reasoning_content = result.get("reasoning_content")
+
+                if not response_text.strip():
+                    response_text = "No response was generated."
+
+                from agentcore.services.deps import session_scope
+                reply_ts = datetime.now(timezone.utc).replace(tzinfo=None)
+                async with session_scope() as db:
+                    agent_msg = OrchConversationTable(
+                        id=uuid4(),
+                        sender="agent",
+                        sender_name=_sender_name,
+                        session_id=_session_id,
+                        text=response_text,
+                        user_id=_user_id,
+                        model_id=_resp_model_id,
+                        reasoning_content=reasoning_content,
+                        timestamp=reply_ts,
+                        files=[],
+                        properties={},
+                        category="message",
+                        content_blocks=[],
+                    )
+                    await orch_add_message(agent_msg, db)
+
+                event_manager.on_end(data={
+                    "agent_text": response_text,
+                    "message_id": str(agent_msg.id),
+                    "reasoning_content": reasoning_content,
+                })
+            except Exception as exc:
+                logger.exception(f"[ORCH-STREAM] Direct mode error: {exc}")
+                event_manager.on_error(data={"text": str(exc)})
+                event_manager.on_end(data={})
+            finally:
+                queue.put_nowait((None, None, None))
+
+        asyncio.create_task(_run_direct_and_persist())
+
+        async def _direct_event_generator():
+            while True:
+                item = await queue.get()
+                if item == (None, None, None):
+                    break
+                _event_id, raw_data, _timestamp = item
+                # raw_data is already JSON-encoded bytes from event_manager
+                if isinstance(raw_data, bytes):
+                    yield raw_data
+                else:
+                    yield str(raw_data).encode("utf-8")
+
+        return StreamingResponse(
+            _direct_event_generator(),
+            media_type="application/x-ndjson",
+        )
+
+    # -- 3. Agent mode streaming (existing flow) -------------------------
+    agent_id = routing["agent_id"]
+    deployment_id = routing["deployment_id"]
+    deployment = routing["deployment"]
+
     await _maybe_context_reset(
         session,
         session_id=body.session_id,
@@ -1102,7 +1702,6 @@ async def orch_chat_stream(
         new_deployment_id=deployment_id,
     )
 
-    # -- 3. Persist user message -----------------------------------------
     stream_msg_ts = datetime.now(timezone.utc).replace(tzinfo=None)
     user_msg = OrchConversationTable(
         id=uuid4(),
@@ -1121,11 +1720,9 @@ async def orch_chat_stream(
     )
     await orch_add_message(user_msg, session)
 
-    # -- 4. Set up streaming queue + event manager -----------------------
     queue: asyncio.Queue = asyncio.Queue()
     event_manager = create_default_event_manager(queue)
 
-    # Capture values needed by the background coroutine
     agent_id_str = str(agent_id)
     agent_name = deployment.agent_name
     input_value = body.input_value
@@ -1425,8 +2022,51 @@ async def delete_orch_session(
     try:
         await orch_delete_session(session, session_id, user_id=current_user.id)
         await orch_delete_session_transactions(session, session_id)
+        # Cleanup document Q&A vectors from Pinecone
+        try:
+            from agentcore.services.mibuddy.document_processor import cleanup_session_docs
+            await cleanup_session_docs(session_id)
+        except Exception as cleanup_err:
+            logger.warning(f"[DocQA] Cleanup failed for session {session_id}: {cleanup_err}")
     except Exception as e:
         logger.error(f"Error deleting orch session: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 5b. Archive / unarchive a session
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class ArchiveRequest(BaseModel):
+    is_archived: bool = True
+
+
+@router.post("/sessions/{session_id}/archive", status_code=200)
+async def archive_orch_session(
+    *,
+    session: DbSession,
+    current_user: CurrentActiveUser,
+    session_id: str,
+    body: ArchiveRequest,
+):
+    """Toggle archive/unarchive for an orchestrator session."""
+    try:
+        updated = await orch_archive_session(
+            session, session_id, is_archived=body.is_archived, user_id=current_user.id,
+        )
+        if updated == 0:
+            raise HTTPException(status_code=404, detail="Session not found")
+        action = "archived" if body.is_archived else "unarchived"
+        return {
+            "session_id": session_id,
+            "is_archived": body.is_archived,
+            "message": f"Session {session_id} has been {action} successfully.",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error archiving orch session: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
@@ -1489,4 +2129,254 @@ async def get_active_agent(
         )
     except Exception as e:
         logger.error(f"Error getting active agent: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+from agentcore.services.mibuddy.model_capabilities import detect_capabilities
+
+
+# ---------------------------------------------------------------------------
+# MiBuddy file upload (dedicated container)
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/upload",
+    status_code=201,
+    dependencies=[Depends(PermissionChecker(["interact_agents"]))],
+)
+async def mibuddy_upload_file(
+    *,
+    request: Request,
+    session: DbSession,
+    current_user: CurrentActiveUser,
+    file: UploadFile,
+):
+    """Upload a file to the MiBuddy dedicated container.
+
+    Used by orchestrator model chat for document uploads and chat images.
+    Files are stored in: {mibuddy_container}/{user_id}/{category}/{filename}
+
+    Returns the file_path for use in chat requests.
+    """
+    from agentcore.services.mibuddy.docqa_storage import save_file as mibuddy_save, FileCategory
+    from agentcore.services.mibuddy.document_extractor import IMAGE_EXTENSIONS, SUPPORTED_DOC_EXTENSIONS
+
+    if not file or not file.filename:
+        raise HTTPException(status_code=400, detail="No file provided")
+
+    user_id = str(current_user.id)
+    file_content = await file.read()
+    file_name = file.filename
+    ext = Path(file_name).suffix.lower()
+
+    # Determine category based on file type
+    if ext in IMAGE_EXTENSIONS:
+        category = FileCategory.CHAT_IMAGES
+    elif ext in SUPPORTED_DOC_EXTENSIONS:
+        category = FileCategory.UPLOADS
+    else:
+        category = FileCategory.UPLOADS
+
+    try:
+        file_path = await mibuddy_save(user_id, file_name, file_content, category=category)
+        logger.info(f"[MiBuddy Upload] {category.value}/{file_name} for user {user_id}")
+        return {"file_path": file_path, "category": category.value}
+    except Exception as e:
+        logger.error(f"[MiBuddy Upload] Failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# List AI-generated images from MiBuddy container
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/generated-images",
+    status_code=200,
+    dependencies=[Depends(PermissionChecker(["interact_agents"]))],
+)
+async def list_generated_images(
+    *,
+    current_user: CurrentActiveUser,
+):
+    """List AI-generated images for the current user from the MiBuddy container."""
+    try:
+        from agentcore.services.mibuddy.docqa_storage import list_files, FileCategory
+
+        user_id = str(current_user.id)
+        file_names = await list_files(user_id, category=FileCategory.GENERATED_IMAGES)
+
+        images = []
+        for name in sorted(file_names, reverse=True)[:20]:  # newest first, max 20
+            images.append({
+                "name": name,
+                "src": f"/api/files/images/{user_id}/generated-images/{name}",
+            })
+        return images
+    except Exception as e:
+        logger.error(f"Error listing generated images: {e}")
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Serve MiBuddy images (generated-images, uploads, chat-images)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/images/{user_id}/{subfolder}/{file_name}")
+async def serve_mibuddy_image(user_id: str, subfolder: str, file_name: str):
+    """Serve images from the MiBuddy container subfolders."""
+    from agentcore.services.mibuddy.docqa_storage import get_file_by_path
+    from agentcore.services.storage.constants import build_content_type_from_extension
+
+    extension = file_name.split(".")[-1]
+    try:
+        content_type = build_content_type_from_extension(extension)
+    except Exception:
+        content_type = "image/png"
+
+    try:
+        path = f"{user_id}/{subfolder}/{file_name}"
+        file_content = await get_file_by_path(path)
+        logger.info(f"[MiBuddy] Served image: {path}")
+        return StreamingResponse(BytesIO(file_content), media_type=content_type)
+    except Exception as e:
+        logger.warning(f"[MiBuddy] Image not found: {user_id}/{subfolder}/{file_name}")
+        raise HTTPException(status_code=404, detail=f"Image not found: {file_name}") from e
+
+
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Autocomplete suggestions
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/suggestions",
+    status_code=200,
+    dependencies=[Depends(PermissionChecker(["interact_agents"]))],
+)
+async def get_suggestions(
+    q: str = "",
+):
+    """Generate autocomplete suggestions as user types."""
+    try:
+        from agentcore.services.mibuddy.suggestion_service import get_suggestions
+        suggestions = await get_suggestions(q)
+        return {"suggestions": suggestions}
+    except Exception as e:
+        logger.debug(f"Suggestions failed: {e}")
+        return {"suggestions": []}
+
+
+# ---------------------------------------------------------------------------
+# List available models for orchestrator chat
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/models",
+    response_model=list[OrchModelSummary],
+    status_code=200,
+    dependencies=[Depends(PermissionChecker(["interact_agents"]))],
+)
+async def list_orch_models(
+    *,
+    session: DbSession,
+    current_user: CurrentActiveUser,
+):
+    """List deployed LLM models available to the current user for direct chat.
+
+    Includes:
+    - Virtual entries for configured MiBuddy features (Web Search, Nano Banana, etc.)
+    - Real models from the Model Registry
+    """
+    try:
+        from agentcore.services.database.models.model_registry.model import (
+            ModelApprovalStatus,
+            ModelRegistry,
+        )
+        from agentcore.services.model_service_client import fetch_registry_models_async
+
+        result: list[OrchModelSummary] = []
+        settings = get_settings_service().settings
+        default_model_name = (settings.default_orch_model_name or "").strip().lower()
+
+        logger.info(f"[ORCH Models] image_gen_model_name='{settings.image_gen_model_name}', web_search_model_name='{settings.web_search_model_name}', default_orch_model_name='{settings.default_orch_model_name}'")
+
+        # ── Real models from registry ──
+        raw_rows = await fetch_registry_models_async(
+            model_type="llm",
+            active_only=True,
+        )
+
+        if raw_rows:
+            # Model service returned data — append to result (which already has virtual entries)
+            for row in raw_rows:
+                try:
+                    model_id = row.get("id")
+                    if not model_id:
+                        continue
+                    approval = str(row.get("approval_status", "approved")).lower()
+                    if approval != "approved":
+                        continue
+                    # Filter by show_in: only show models meant for orchestrator
+                    show_in = row.get("show_in") or ["orchestrator", "agent"]
+                    if "orchestrator" not in show_in:
+                        continue
+                    provider = row.get("provider", "")
+                    model_name_val = row.get("model_name", "")
+                    explicit_caps = row.get("capabilities")
+                    merged_caps = detect_capabilities(provider, model_name_val, explicit_caps)
+                    display = row.get("display_name", model_name_val)
+                    result.append(
+                        OrchModelSummary(
+                            model_id=UUID(str(model_id)),
+                            display_name=display,
+                            provider=provider,
+                            model_name=model_name_val,
+                            model_type=row.get("model_type", "llm"),
+                            capabilities=merged_caps,
+                            is_default=bool(default_model_name and display.strip().lower() == default_model_name),
+                        )
+                    )
+                except Exception:
+                    continue
+            # Put default model first
+            result.sort(key=lambda m: (not m.is_default, m.display_name))
+            return result
+
+        # Strategy 2: Fallback to local DB if model service unavailable
+        stmt = (
+            select(ModelRegistry)
+            .where(
+                ModelRegistry.is_active.is_(True),
+                ModelRegistry.model_type == "llm",
+                ModelRegistry.approval_status == ModelApprovalStatus.APPROVED.value,
+            )
+            .order_by(ModelRegistry.provider, ModelRegistry.display_name)
+        )
+        rows = (await session.exec(stmt)).all()
+
+        return [
+            OrchModelSummary(
+                model_id=row.id,
+                display_name=row.display_name,
+                provider=row.provider,
+                model_name=row.model_name,
+                model_type=row.model_type,
+                capabilities=detect_capabilities(row.provider, row.model_name, row.capabilities),
+                is_default=bool(default_model_name and row.display_name.strip().lower() == default_model_name),
+            )
+            for row in rows
+            if "orchestrator" in (row.show_in or ["orchestrator", "agent"])
+        ]
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error listing orchestrator models: {e}")
         raise HTTPException(status_code=500, detail=str(e)) from e

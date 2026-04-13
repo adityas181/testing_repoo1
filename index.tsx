@@ -421,6 +421,8 @@ export default function AgentOrchestrator() {
   const [selectedGalleryImage, setSelectedGalleryImage] = useState<{ src: string; name: string } | null>(null);
   // Addon: Canvas mode
   const [isCanvasEnabled, setIsCanvasEnabled] = useState(false);
+  // Addon: Image generation mode (sticky chip — stays until user clicks ×)
+  const [imageMode, setImageMode] = useState(false);
   const [canvasEditingId, setCanvasEditingId] = useState<string | null>(null);
   const [canvasEditTexts, setCanvasEditTexts] = useState<Record<string, string>>({});
   // Addon: Autocomplete suggestions
@@ -1008,6 +1010,52 @@ export default function AgentOrchestrator() {
     synth.speak(utterance);
   }, []);
 
+  /* ------------------ EXPORT MESSAGE (DOCX / PDF) ------------------ */
+
+  const renderMarkdownToHtml = useCallback((md: string): string => {
+    // Lightweight markdown → HTML (headings, bold, italic, code, links, lists, line breaks)
+    const esc = (s: string) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    let html = esc(md);
+    html = html.replace(/```([\s\S]*?)```/g, (_, code) => `<pre><code>${code}</code></pre>`);
+    html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+    html = html.replace(/^###### (.*)$/gm, "<h6>$1</h6>");
+    html = html.replace(/^##### (.*)$/gm, "<h5>$1</h5>");
+    html = html.replace(/^#### (.*)$/gm, "<h4>$1</h4>");
+    html = html.replace(/^### (.*)$/gm, "<h3>$1</h3>");
+    html = html.replace(/^## (.*)$/gm, "<h2>$1</h2>");
+    html = html.replace(/^# (.*)$/gm, "<h1>$1</h1>");
+    html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    html = html.replace(/\*([^*]+)\*/g, "<em>$1</em>");
+    html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
+    html = html.replace(/^\s*[-*+] (.*)$/gm, "<li>$1</li>");
+    html = html.replace(/(<li>[\s\S]*?<\/li>)/g, "<ul>$1</ul>");
+    html = html.replace(/\n{2,}/g, "</p><p>");
+    html = html.replace(/\n/g, "<br/>");
+    return `<p>${html}</p>`;
+  }, []);
+
+  const handleExportDocx = useCallback((text: string) => {
+    if (!text) return;
+    const body = renderMarkdownToHtml(text);
+    const html = `<html xmlns:o='urn:schemas-microsoft-com:office:office' xmlns:w='urn:schemas-microsoft-com:office:word' xmlns='http://www.w3.org/TR/REC-html40'><head><meta charset='utf-8'><title>Export</title><style>body{font-family:Calibri,Arial,sans-serif;font-size:11pt;line-height:1.5;}h1,h2,h3,h4{color:#1a1a1a;}pre{background:#f5f5f5;padding:8px;border-radius:4px;font-family:Consolas,monospace;white-space:pre-wrap;}code{background:#f5f5f5;padding:2px 4px;border-radius:3px;font-family:Consolas,monospace;}</style></head><body>${body}</body></html>`;
+    const blob = new Blob(["\ufeff", html], { type: "application/msword" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `response-${Date.now()}.doc`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [renderMarkdownToHtml]);
+
+  const handleExportPdf = useCallback((text: string) => {
+    if (!text) return;
+    const body = renderMarkdownToHtml(text);
+    const printWindow = window.open("", "_blank", "width=800,height=600");
+    if (!printWindow) return;
+    printWindow.document.write(`<html><head><title>Export</title><style>body{font-family:Arial,sans-serif;font-size:12pt;line-height:1.6;max-width:800px;margin:40px auto;padding:0 20px;color:#1a1a1a;}h1,h2,h3,h4{color:#000;}pre{background:#f5f5f5;padding:10px;border-radius:4px;font-family:Consolas,monospace;white-space:pre-wrap;overflow-x:auto;}code{background:#f5f5f5;padding:2px 4px;border-radius:3px;font-family:Consolas,monospace;}a{color:#2563eb;}@media print{body{margin:0;}}</style></head><body>${body}<script>window.onload=function(){window.print();setTimeout(function(){window.close();},500);}</script></body></html>`);
+    printWindow.document.close();
+  }, [renderMarkdownToHtml]);
+
   /* ------------------ SEND MESSAGE ------------------ */
 
   const handleSend = useCallback(async () => {
@@ -1190,6 +1238,11 @@ export default function AgentOrchestrator() {
       requestBody.enable_reasoning = true;
     }
 
+    // Image mode: explicit flag — backend skips intent classification and routes to image generation
+    if (imageMode) {
+      requestBody.image_mode = true;
+    }
+
     if (filePaths.length > 0) {
       requestBody.files = filePaths;
     }
@@ -1365,7 +1418,7 @@ export default function AgentOrchestrator() {
       setStreamingAgentName("");
       setStreamingMsgId(null);
     }
-  }, [canInteract, input, isSending, agents, selectedAgent, selectedModelId, noAgentMode, selectedAiModel, currentSessionId, effectiveSessionId, refetchSessions, refetchMessages]);
+  }, [canInteract, input, isSending, agents, selectedAgent, selectedModelId, noAgentMode, selectedAiModel, currentSessionId, effectiveSessionId, refetchSessions, refetchMessages, imageMode, cotReasoning]);
 
   /* ------------------ SESSION MANAGEMENT ------------------ */
 
@@ -1483,39 +1536,90 @@ export default function AgentOrchestrator() {
           </button>
 
           {/* Search chats */}
-          <div className="relative">
-            <button
-              onClick={() => {
-                if (showSearchInput) {
-                  setShowSearchInput(false);
-                  setSidebarSearchQuery("");
-                } else {
-                  setShowSearchInput(true);
-                  setShowChatHistoryExpand(true);
-                }
-              }}
-              className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
-            >
-              <Search size={16} className="shrink-0 text-muted-foreground" />
-              <span>{t("Search chats")}</span>
-            </button>
-            {showSearchInput && (
-              <input
-                type="text"
-                value={sidebarSearchQuery}
-                onChange={(e) => {
-                  setSidebarSearchQuery(e.target.value);
-                  if (e.target.value.trim()) {
-                    setShowChatHistoryExpand(true);
-                    setShowArchiveChatExpand(true);
-                  }
-                }}
-                placeholder={t("Search...")}
-                className="mx-3 mb-1 mt-0.5 w-[calc(100%-1.5rem)] rounded-md border border-border bg-background px-2.5 py-1.5 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
-                autoFocus
-              />
-            )}
-          </div>
+          <button
+            onClick={() => {
+              setShowSearchInput(true);
+              setSidebarSearchQuery("");
+            }}
+            className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
+          >
+            <Search size={16} className="shrink-0 text-muted-foreground" />
+            <span>{t("Search chats")}</span>
+          </button>
+
+          {/* Search overlay */}
+          {showSearchInput && (
+            <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/30 pt-[10vh]" onClick={() => { setShowSearchInput(false); setSidebarSearchQuery(""); }}>
+              <div
+                className="w-full max-w-lg rounded-xl bg-background shadow-2xl border border-border"
+                onClick={(e) => e.stopPropagation()}
+              >
+                {/* Search input header */}
+                <div className="flex items-center gap-2 border-b border-border px-4 py-3">
+                  <input
+                    type="text"
+                    value={sidebarSearchQuery}
+                    onChange={(e) => setSidebarSearchQuery(e.target.value)}
+                    placeholder={t("Search chats...")}
+                    className="flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground focus:outline-none"
+                    autoFocus
+                  />
+                  <button
+                    onClick={() => { setShowSearchInput(false); setSidebarSearchQuery(""); }}
+                    className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+
+                {/* New chat button */}
+                <button
+                  onClick={() => { setShowSearchInput(false); setSidebarSearchQuery(""); handleNewChat(); }}
+                  className="flex w-full items-center gap-3 px-4 py-3 text-sm font-medium text-foreground hover:bg-accent"
+                >
+                  <SquarePen size={16} className="shrink-0 text-muted-foreground" />
+                  <span>{t("New-chat")}</span>
+                </button>
+
+                {/* Recent sessions list */}
+                <div className="max-h-[50vh] overflow-y-auto px-2 pb-3" style={{ scrollbarWidth: "thin" }}>
+                  {Object.entries(grouped).length === 0 && sidebarSearchQuery.trim() ? (
+                    <div className="px-4 py-6 text-center text-sm text-muted-foreground">
+                      {t("No matching chats")}
+                    </div>
+                  ) : (
+                    Object.entries(grouped).map(([date, chats]) => (
+                      <div key={date} className="mb-1">
+                        <div className="px-3 pb-1 pt-3 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                          {date}
+                        </div>
+                        {chats.map((chat) => (
+                          <button
+                            key={chat.session_id}
+                            onClick={() => { setShowSearchInput(false); setSidebarSearchQuery(""); handleSelectSession(chat.session_id); }}
+                            className={`flex w-full items-start gap-3 rounded-lg px-3 py-2.5 text-left text-sm hover:bg-accent ${
+                              currentSessionId === chat.session_id ? "bg-accent" : ""
+                            }`}
+                          >
+                            <MessageSquare size={14} className="mt-0.5 shrink-0 opacity-50" />
+                            <div className="min-w-0 flex-1">
+                              <div className="truncate font-medium text-foreground">
+                                {chat.active_agent_name || t("Chat")}
+                                {chat.active_agent_name ? ` - ${chat.active_agent_name}` : ""}
+                              </div>
+                              <div className="mt-0.5 truncate text-xs text-muted-foreground">
+                                {chat.preview || t("New conversation")}
+                              </div>
+                            </div>
+                          </button>
+                        ))}
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Image — toggles gallery view in main area */}
           <button
@@ -1719,11 +1823,20 @@ export default function AgentOrchestrator() {
           style={{ bottom: plusMenuPos.bottom, left: plusMenuPos.left }}
         >
           <button
-            onClick={() => setShowPlusMenu(false)}
-            className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
+            onClick={() => {
+              setShowPlusMenu(false);
+              setImageMode(true);
+              setIsCanvasEnabled(false);
+            }}
+            className="flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
           >
-            <Paintbrush size={16} className="text-muted-foreground" />
-            <span>{t("Create image")}</span>
+            <div className="flex items-center gap-3">
+              <Paintbrush size={16} className={imageMode ? "text-red-500" : "text-muted-foreground"} />
+              <span>{t("Create image")}</span>
+            </div>
+            {imageMode && (
+              <span className="text-xs font-medium text-red-500">ON</span>
+            )}
           </button>
           <button
             onClick={() => {
@@ -2170,16 +2283,34 @@ export default function AgentOrchestrator() {
                           chatMessage={msg.content}
                           editedFlag={null}
                         />
-                        {/* Text-to-Speech button — hide for image-only responses */}
+                        {/* Action buttons row — hide for image-only responses */}
                         {msg.content && !isSending && !(/^\s*!\[.*\]\(.*\)\s*$/.test(msg.content.trim())) && (
-                          <button
-                            onClick={() => handleSpeak(msg.content)}
-                            className="mt-1.5 flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
-                            title={t("Read aloud")}
-                          >
-                            <AudioLines size={13} />
-                            <span>{t("Read aloud")}</span>
-                          </button>
+                          <div className="mt-1.5 flex items-center gap-1">
+                            <button
+                              onClick={() => handleSpeak(msg.content)}
+                              className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
+                              title={t("Read aloud")}
+                            >
+                              <AudioLines size={13} />
+                              <span>{t("Read aloud")}</span>
+                            </button>
+                            <button
+                              onClick={() => handleExportDocx(msg.content)}
+                              className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
+                              title={t("Export as Word")}
+                            >
+                              <FileText size={13} />
+                              <span>{t("Word")}</span>
+                            </button>
+                            <button
+                              onClick={() => handleExportPdf(msg.content)}
+                              className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
+                              title={t("Export as PDF")}
+                            >
+                              <Download size={13} />
+                              <span>{t("PDF")}</span>
+                            </button>
+                          </div>
                         )}
                         {/* HITL action buttons */}
                         {msg.hitl && (
@@ -2419,6 +2550,21 @@ export default function AgentOrchestrator() {
                     <span className="text-xs font-semibold text-red-500">{t("Canvas")}</span>
                     <button
                       onClick={() => setIsCanvasEnabled(false)}
+                      className="ml-0.5 rounded-full p-0.5 text-red-400 hover:bg-red-100 hover:text-red-600 dark:hover:bg-red-900/50"
+                    >
+                      <X size={10} />
+                    </button>
+                  </div>
+                </div>
+              )}
+              {/* Image mode indicator pill */}
+              {imageMode && (
+                <div className="flex items-center px-4 pb-1">
+                  <div className="inline-flex items-center gap-1.5 rounded-full border border-red-200 bg-red-50 px-3 py-1 dark:border-red-800 dark:bg-red-950/30">
+                    <Image size={12} className="text-red-500" />
+                    <span className="text-xs font-semibold text-red-500">{t("Image")}</span>
+                    <button
+                      onClick={() => setImageMode(false)}
                       className="ml-0.5 rounded-full p-0.5 text-red-400 hover:bg-red-100 hover:text-red-600 dark:hover:bg-red-900/50"
                     >
                       <X size={10} />
