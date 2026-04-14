@@ -1027,9 +1027,10 @@ async def _route_request(
                     selected_model.model_name,
                     selected_model.capabilities,
                 )
-                # If user selected a web_search model → force web search
+                # If user selected a web_search-capable model → force web search mode
+                # (the model's web_search=true capability means it was registered for grounded answers)
                 if caps.get("web_search"):
-                    logger.info(f"[ORCH] User selected web search model: {selected_model.display_name}")
+                    logger.info(f"[ORCH] Selected model '{selected_model.display_name}' has web_search capability — forcing web_search mode")
                     return {
                         "mode": "web_search",
                         "agent_id": None,
@@ -1650,12 +1651,14 @@ async def orch_chat_stream(
                 elif _mode == "web_search":
                     from agentcore.services.mibuddy.web_search_handler import handle_web_search_stream
                     from agentcore.services.mibuddy.system_prompts import get_system_identity_prompt
+                    logger.warning(f"[ORCH-STREAM] >>> ABOUT TO CALL handle_web_search_stream with enable_reasoning={_enable_reasoning}")
                     result = await handle_web_search_stream(
                         _input_value,
                         system_message=get_system_identity_prompt(),
                         event_manager=event_manager,
                         enable_reasoning=_enable_reasoning,
                     )
+                    logger.warning(f"[ORCH-STREAM] <<< handle_web_search_stream RETURNED, reasoning_len={len(result.get('reasoning_content') or '')}, response_len={len(result.get('response_text') or '')}")
                 elif _mode == "image_gen":
                     from agentcore.services.mibuddy.image_gen_handler import handle_image_generation_stream
                     result = await handle_image_generation_stream(
