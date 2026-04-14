@@ -1159,7 +1159,36 @@ async def _route_request(
             if is_default_model:
                 from agentcore.services.mibuddy.smart_router import route_to_best_model
                 logger.info(f"[ORCH] Default model (smart router): analyzing query to pick best model")
-                routed = await route_to_best_model(body.input_value)
+
+                # Detect attached files (image/document) for routing hints
+                has_image = False
+                has_document = False
+                if body.files:
+                    from agentcore.services.mibuddy.document_extractor import IMAGE_EXTENSIONS, SUPPORTED_DOC_EXTENSIONS
+                    for f in body.files:
+                        ext = Path(f).suffix.lower()
+                        if ext in IMAGE_EXTENSIONS:
+                            has_image = True
+                        elif ext in SUPPORTED_DOC_EXTENSIONS:
+                            has_document = True
+
+                # Pull last model used in this session for follow-up routing
+                last_model = None
+                try:
+                    prev_messages = await orch_get_messages(session, session_id=body.session_id)
+                    for prev in reversed(prev_messages or []):
+                        if getattr(prev, "sender", "") == "agent":
+                            last_model = getattr(prev, "sender_name", None)
+                            break
+                except Exception:
+                    pass
+
+                routed = await route_to_best_model(
+                    body.input_value,
+                    last_model=last_model,
+                    has_image=has_image,
+                    has_document=has_document,
+                )
                 if routed:
                     routed_id, routed_name = routed
                     logger.info(f"[ORCH] Smart router selected: {routed_name}")
@@ -1431,10 +1460,12 @@ async def orch_chat(
             enriched_prompt = build_doc_qa_prompt(body.input_value, chunks)
             if not resp_model_id:
                 raise HTTPException(status_code=400, detail="No model selected for document Q&A.")
+            image_files = routing.get("image_files", [])
             result = await direct_model_chat(
                 model_id=str(resp_model_id),
                 input_value=enriched_prompt,
                 session_id=body.session_id,
+                files=image_files,
             )
             response_text = result["response_text"]
             reasoning_content = result.get("reasoning_content")
@@ -1559,6 +1590,7 @@ async def orch_chat_stream(
         _mode = mode
         _files = body.files
         _doc_files = routing.get("doc_files", [])
+        _image_files = routing.get("image_files", [])
 
         async def _run_direct_and_persist():
             try:
@@ -1602,6 +1634,7 @@ async def orch_chat_stream(
                         model_id=str(_resp_model_id),
                         input_value=enriched_prompt,
                         session_id=_session_id,
+                        files=_image_files,
                         event_manager=event_manager,
                     )
                 elif _mode == "model_direct":

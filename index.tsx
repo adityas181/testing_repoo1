@@ -1,6 +1,6 @@
 import { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
-import { Send, Sparkles, ChevronDown, Plus, MessageSquare, PanelLeftClose, PanelLeft, User, Loader2, Trash2, Check, ImagePlus, X, Clock, Search, Image, Archive, ChevronRight, Globe, BookOpen, Headphones, Info, HelpCircle, Mic, AudioLines, FileUp, Paintbrush, Lightbulb, Upload, MoreVertical, Folder, ArrowLeft, File, FileText, Shield, CheckCircle2, SquarePen, Mail, Download } from "lucide-react";
+import { Send, Sparkles, ChevronDown, Plus, MessageSquare, PanelLeftClose, PanelLeft, User, Loader2, Trash2, Check, ImagePlus, X, Clock, Search, Image, Archive, ChevronRight, Globe, BookOpen, Headphones, Info, HelpCircle, Mic, AudioLines, FileUp, Paintbrush, Lightbulb, Upload, MoreVertical, Folder, ArrowLeft, File, FileText, Shield, CheckCircle2, SquarePen, Mail, Download, Copy } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import {
   useGetOrchAgents,
@@ -24,6 +24,8 @@ import { ContentBlockDisplay } from "@/components/core/chatComponents/ContentBlo
 import type { ContentBlock } from "@/types/chat";
 import SharePointFilePicker from "./SharePointFilePicker";
 import OutlookConnector, { useOutlookStatus } from "./OutlookConnector";
+import NotebookLMPanel from "./NotebookLMPanel";
+import useAlertStore from "@/stores/alertStore";
 
 /* ------------------ TYPES ------------------ */
 
@@ -418,11 +420,15 @@ export default function AgentOrchestrator() {
   const [spPickerOpen, setSpPickerOpen] = useState(false);
   // Addon: Image gallery view (replaces chat area when active)
   const [showImageGallery, setShowImageGallery] = useState(false);
+  const [showNotebookLM, setShowNotebookLM] = useState(false);
   const [selectedGalleryImage, setSelectedGalleryImage] = useState<{ src: string; name: string } | null>(null);
   // Addon: Canvas mode
   const [isCanvasEnabled, setIsCanvasEnabled] = useState(false);
   // Addon: Image generation mode (sticky chip — stays until user clicks ×)
   const [imageMode, setImageMode] = useState(false);
+  // Addon: Per-message export menu (msg.id) and copy feedback
+  const [exportMenuOpenId, setExportMenuOpenId] = useState<string | null>(null);
+  const [copiedMsgId, setCopiedMsgId] = useState<string | null>(null);
   const [canvasEditingId, setCanvasEditingId] = useState<string | null>(null);
   const [canvasEditTexts, setCanvasEditTexts] = useState<Record<string, string>>({});
   // Addon: Autocomplete suggestions
@@ -563,8 +569,23 @@ export default function AgentOrchestrator() {
   /* ------------------ SHAREPOINT FILE PICKER (Addon) ------------------ */
 
   const handleSpFilesSelected = (files: File[]) => {
+    const rejected: string[] = [];
     for (const file of files) {
+      const ext = file.name.split(".").pop()?.toLowerCase();
+      if (!ext || !ALLOWED_EXTENSIONS.includes(ext)) {
+        rejected.push(file.name);
+        continue;
+      }
       uploadFile(file);
+    }
+    if (rejected.length > 0) {
+      const allowedHint = noAgentMode
+        ? "Allowed file types: documents and images."
+        : "When an agent is selected, only image files are accepted. Switch to Model mode to upload documents.";
+      useAlertStore.getState().setErrorData({
+        title: "Some SharePoint files were not uploaded",
+        list: [...rejected, allowedHint],
+      });
     }
   };
 
@@ -772,6 +793,10 @@ export default function AgentOrchestrator() {
       // Close three-dot chat menu when clicking outside
       if (!(e.target as Element)?.closest?.("[data-chat-menu]")) {
         setChatMenuOpenId(null);
+      }
+      // Close per-message export menu when clicking outside
+      if (!(e.target as Element)?.closest?.("[data-export-menu]")) {
+        setExportMenuOpenId(null);
       }
       // Close suggestions when clicking outside input area
       if (!(e.target as Element)?.closest?.("textarea")) {
@@ -1055,6 +1080,36 @@ export default function AgentOrchestrator() {
     printWindow.document.write(`<html><head><title>Export</title><style>body{font-family:Arial,sans-serif;font-size:12pt;line-height:1.6;max-width:800px;margin:40px auto;padding:0 20px;color:#1a1a1a;}h1,h2,h3,h4{color:#000;}pre{background:#f5f5f5;padding:10px;border-radius:4px;font-family:Consolas,monospace;white-space:pre-wrap;overflow-x:auto;}code{background:#f5f5f5;padding:2px 4px;border-radius:3px;font-family:Consolas,monospace;}a{color:#2563eb;}@media print{body{margin:0;}}</style></head><body>${body}<script>window.onload=function(){window.print();setTimeout(function(){window.close();},500);}</script></body></html>`);
     printWindow.document.close();
   }, [renderMarkdownToHtml]);
+
+  const handleExportText = useCallback((text: string) => {
+    if (!text) return;
+    const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `response-${Date.now()}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, []);
+
+  const handleCopyMessage = useCallback(async (text: string, msgId: string) => {
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // Fallback for non-secure contexts
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand("copy"); } catch {}
+      document.body.removeChild(ta);
+    }
+    setCopiedMsgId(msgId);
+    setTimeout(() => setCopiedMsgId((id) => (id === msgId ? null : id)), 1500);
+  }, []);
 
   /* ------------------ SEND MESSAGE ------------------ */
 
@@ -1524,11 +1579,26 @@ export default function AgentOrchestrator() {
           </button>
         </div>
 
+        {/* ---- Single scrollable region containing nav + apps + info + agents.
+              Without this, expanding "Chat history" pushed the Applications
+              and Agents sections off-screen because the sidebar itself is
+              overflow-hidden. */}
+        <div
+          className="flex min-h-0 flex-1 flex-col overflow-y-auto scroll-smooth"
+          style={{ scrollbarWidth: "thin" }}
+        >
         {/* ---- Addon: Sidebar Navigation Items ---- */}
         <div className="flex flex-col gap-0.5 px-2 pb-2">
           {/* New chat */}
           <button
-            onClick={handleNewChat}
+            onClick={() => {
+              // Close any inline panel (NotebookLM / Image gallery) first,
+              // otherwise the chat view stays hidden behind them and the
+              // click silently does nothing from the user's POV.
+              setShowNotebookLM(false);
+              setShowImageGallery(false);
+              handleNewChat();
+            }}
             className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
           >
             <SquarePen size={16} className="shrink-0 text-muted-foreground" />
@@ -1623,7 +1693,10 @@ export default function AgentOrchestrator() {
 
           {/* Image — toggles gallery view in main area */}
           <button
-            onClick={() => setShowImageGallery(!showImageGallery)}
+            onClick={() => {
+              setShowImageGallery(!showImageGallery);
+              setShowNotebookLM(false);
+            }}
             className={`flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent ${showImageGallery ? "bg-accent" : ""}`}
           >
             <Image size={16} className="shrink-0 text-muted-foreground" />
@@ -1640,7 +1713,7 @@ export default function AgentOrchestrator() {
             <ChevronRight size={14} className={`text-muted-foreground transition-transform ${showChatHistoryExpand ? "rotate-90" : ""}`} />
           </button>
           {showChatHistoryExpand && (
-            <div className="ml-4 max-h-[40vh] overflow-y-auto scroll-smooth border-l border-border pl-1" style={{ scrollbarWidth: "thin" }}>
+            <div className="ml-4 border-l border-border pl-1">
               {Object.entries(grouped).map(([date, chats]) => (
                 <div key={date} className="mb-2">
                   <div className="px-3 pb-1 pt-2 text-xxs font-semibold uppercase tracking-wide text-muted-foreground">
@@ -1695,7 +1768,7 @@ export default function AgentOrchestrator() {
             <ChevronRight size={14} className={`text-muted-foreground transition-transform ${showArchiveChatExpand ? "rotate-90" : ""}`} />
           </button>
           {showArchiveChatExpand && (
-            <div className="ml-4 max-h-[30vh] overflow-y-auto scroll-smooth border-l border-border pl-1" style={{ scrollbarWidth: "thin" }}>
+            <div className="ml-4 border-l border-border pl-1">
               {archivedSessions.length === 0 ? (
                 <div className="px-3 py-4 text-center text-xs text-muted-foreground">
                   {t("No archived chats")}
@@ -1753,15 +1826,18 @@ export default function AgentOrchestrator() {
               <span>{t("AI Translator")}</span>
             </button>
             <button
-              onClick={() => window.open("https://do33.motherson.com", "_blank")}
+              onClick={() => window.open("https://genai.motherson.com/do33", "_blank")}
               className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
             >
               <Image size={16} className="shrink-0 text-green-500" />
               <span>{t("DO33")}</span>
             </button>
             <button
-              onClick={() => window.open("https://notebooklm.google.com", "_blank")}
-              className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
+              onClick={() => {
+                setShowNotebookLM(true);
+                setShowImageGallery(false);
+              }}
+              className={`flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent ${showNotebookLM ? "bg-accent" : ""}`}
             >
               <Headphones size={16} className="shrink-0 text-red-500" />
               <span>{t("NotebookLM")}</span>
@@ -1769,24 +1845,44 @@ export default function AgentOrchestrator() {
           </div>
         </div>
 
-        {/* ---- Addon: Information & Help ---- */}
+        {/* ---- Addon: Information & Help (wired same as MiBuddy) ----
+              Information → opens the MiBuddy user-manual PDF in a new tab.
+              Help → opens the user's mail client pre-populated to the
+              MiBuddy support distribution lists. */}
         <div className="border-t border-border px-2 pb-3 pt-2">
-          <button className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent">
+          <button
+            onClick={() =>
+              window.open(
+                "https://mibuddystorageaccount.blob.core.windows.net/genieusermanual/MIBuddyusermanual.pdf",
+                "_blank",
+              )
+            }
+            className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
+          >
             <Info size={16} className="shrink-0 text-muted-foreground" />
             <span>{t("Information")}</span>
           </button>
-          <button className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent">
+          <button
+            onClick={() => {
+              const subject = encodeURIComponent(
+                "MiBuddy : Please detail the support required",
+              );
+              window.location.href = `mailto:support.mtsl@motherson.com,MiBuddy.Feedback@motherson.com?subject=${subject}`;
+            }}
+            className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
+          >
             <HelpCircle size={16} className="shrink-0 text-muted-foreground" />
             <span>{t("Help")}</span>
           </button>
         </div>
 
-        {/* Agents Panel */}
-        <div className="flex min-h-0 flex-1 flex-col border-t border-border">
+        {/* Agents Panel — no internal scroll; participates in the single
+            sidebar scroll defined by the parent wrapper. */}
+        <div className="flex shrink-0 flex-col border-t border-border">
           <div className="shrink-0 px-4 pb-2 pt-3 text-xxs font-semibold uppercase tracking-wide text-muted-foreground">
             {t("Agents")}
           </div>
-          <div className="flex-1 overflow-y-auto scroll-smooth px-2 pb-2" style={{ scrollbarWidth: "thin" }}>
+          <div className="px-2 pb-2">
             <div className="flex flex-col gap-0.5">
               {agents.map((agent) => (
                 <button
@@ -1812,6 +1908,7 @@ export default function AgentOrchestrator() {
               ))}
             </div>
           </div>
+        </div>
         </div>
       </div>
 
@@ -1945,7 +2042,10 @@ export default function AgentOrchestrator() {
       )}
 
       {/* ================ MAIN AREA ================ */}
-      {showImageGallery ? (
+      {showNotebookLM ? (
+        /* ---- NotebookLM panel (inline, like image gallery) ---- */
+        <NotebookLMPanel onBack={() => setShowNotebookLM(false)} />
+      ) : showImageGallery ? (
         /* ---- Image Gallery View ---- */
         <ImageGalleryView
           onBack={() => setShowImageGallery(false)}
@@ -2283,33 +2383,57 @@ export default function AgentOrchestrator() {
                           chatMessage={msg.content}
                           editedFlag={null}
                         />
-                        {/* Action buttons row — hide for image-only responses */}
-                        {msg.content && !isSending && !(/^\s*!\[.*\]\(.*\)\s*$/.test(msg.content.trim())) && (
+                        {/* Action buttons row — hide when message contains a generated image */}
+                        {msg.content && !isSending && !/!\[.*?\]\(.*?\)/.test(msg.content) && (
                           <div className="mt-1.5 flex items-center gap-1">
                             <button
+                              onClick={() => handleCopyMessage(msg.content, msg.id)}
+                              className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
+                              title={copiedMsgId === msg.id ? t("Copied!") : t("Copy")}
+                            >
+                              {copiedMsgId === msg.id ? <Check size={13} className="text-green-600" /> : <Copy size={13} />}
+                            </button>
+                            <button
                               onClick={() => handleSpeak(msg.content)}
-                              className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
+                              className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
                               title={t("Read aloud")}
                             >
                               <AudioLines size={13} />
-                              <span>{t("Read aloud")}</span>
                             </button>
-                            <button
-                              onClick={() => handleExportDocx(msg.content)}
-                              className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
-                              title={t("Export as Word")}
-                            >
-                              <FileText size={13} />
-                              <span>{t("Word")}</span>
-                            </button>
-                            <button
-                              onClick={() => handleExportPdf(msg.content)}
-                              className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
-                              title={t("Export as PDF")}
-                            >
-                              <Download size={13} />
-                              <span>{t("PDF")}</span>
-                            </button>
+                            <div className="relative" data-export-menu>
+                              <button
+                                onClick={() => setExportMenuOpenId(exportMenuOpenId === msg.id ? null : msg.id)}
+                                className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
+                                title={t("Export")}
+                              >
+                                <Download size={13} />
+                              </button>
+                              {exportMenuOpenId === msg.id && (
+                                <div className="absolute left-0 top-full z-50 mt-1 min-w-[140px] rounded-lg border border-border bg-popover p-1 shadow-lg">
+                                  <button
+                                    onClick={() => { handleExportDocx(msg.content); setExportMenuOpenId(null); }}
+                                    className="flex w-full items-center gap-2 rounded-md px-3 py-1.5 text-left text-sm text-foreground hover:bg-accent"
+                                  >
+                                    <FileText size={14} className="text-blue-600" />
+                                    <span>{t("Word")}</span>
+                                  </button>
+                                  <button
+                                    onClick={() => { handleExportPdf(msg.content); setExportMenuOpenId(null); }}
+                                    className="flex w-full items-center gap-2 rounded-md px-3 py-1.5 text-left text-sm text-foreground hover:bg-accent"
+                                  >
+                                    <FileText size={14} className="text-red-600" />
+                                    <span>{t("PDF")}</span>
+                                  </button>
+                                  <button
+                                    onClick={() => { handleExportText(msg.content); setExportMenuOpenId(null); }}
+                                    className="flex w-full items-center gap-2 rounded-md px-3 py-1.5 text-left text-sm text-foreground hover:bg-accent"
+                                  >
+                                    <File size={14} className="text-muted-foreground" />
+                                    <span>{t("Text")}</span>
+                                  </button>
+                                </div>
+                              )}
+                            </div>
                           </div>
                         )}
                         {/* HITL action buttons */}
