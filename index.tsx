@@ -2519,13 +2519,10 @@ export default function AgentOrchestrator() {
                       </div>
                     ) : (
                       <div className="text-[15px] leading-relaxed text-foreground/80">
+                        {/* DEBUG: unique marker that will appear in DOM if this branch renders */}
+                        <div data-debug-marker={`REASONING_BRANCH_${msg.id}`}>__BRANCH_OK__</div>
                         {/* CoT Reasoning — plain div-based (no details/summary) */}
-                        {(() => {
-                          if (msg.reasoningContent) {
-                            console.warn("[Orch][render] RENDERING reasoning pill for msg", msg.id, "length:", msg.reasoningContent?.length);
-                          }
-                          return msg.reasoningContent;
-                        })() && (
+                        {Boolean(msg.reasoningContent) && (
                           <ReasoningBlock
                             reasoning={msg.reasoningContent!}
                             streaming={isSending && msg.id === streamingMsgId}
