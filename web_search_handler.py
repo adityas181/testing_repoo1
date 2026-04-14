@@ -131,8 +131,12 @@ async def handle_web_search(query: str, system_message: str = "") -> dict:
         return {"response_text": "Web search encountered an error. Please try again.", "model_name": "gemini"}
 
 
-async def handle_web_search_stream(query: str, system_message: str = "", event_manager=None) -> dict:
-    """Stream web search response."""
+async def handle_web_search_stream(query: str, system_message: str = "", event_manager=None, enable_reasoning: bool = False) -> dict:
+    """Stream web search response.
+
+    When enable_reasoning=True, Gemini 2.5+/3.x emits thought summaries alongside
+    the answer via thinking_config.include_thoughts.
+    """
     from google import genai
     from google.genai import types
 
@@ -150,20 +154,36 @@ async def handle_web_search_stream(query: str, system_message: str = "", event_m
 
         tools = [types.Tool(google_search=types.GoogleSearch())]
 
-        config = types.GenerateContentConfig(
-            temperature=1,
-            top_p=0.95,
-            max_output_tokens=65535,
-            safety_settings=[
+        config_kwargs = {
+            "temperature": 1,
+            "top_p": 0.95,
+            "max_output_tokens": 65535,
+            "safety_settings": [
                 types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="OFF"),
                 types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="OFF"),
                 types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="OFF"),
                 types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="OFF"),
             ],
-            tools=tools,
-        )
+            "tools": tools,
+        }
+        # Enable visible thinking for Gemini 2.5+ / 3.x
+        if enable_reasoning:
+            try:
+                # thinking_budget=-1 enables dynamic thinking (model decides how much).
+                # Some SDK versions need thinking_budget along with include_thoughts.
+                config_kwargs["thinking_config"] = types.ThinkingConfig(
+                    include_thoughts=True,
+                    thinking_budget=-1,
+                )
+                logger.info(f"[WebSearch] enable_reasoning=True — attached ThinkingConfig(include_thoughts=True)")
+            except (AttributeError, TypeError) as e:
+                logger.warning(f"[WebSearch] ThinkingConfig not supported: {e}")
+        else:
+            logger.info(f"[WebSearch] enable_reasoning=False — no thinking config")
+        config = types.GenerateContentConfig(**config_kwargs)
 
         full_response = ""
+        full_reasoning = ""
         grounding_used = False
         search_queries: list[str] = []
         for chunk in client.models.generate_content_stream(
@@ -181,18 +201,36 @@ async def handle_web_search_stream(query: str, system_message: str = "", event_m
                 for q in queries:
                     if q not in search_queries:
                         search_queries.append(q)
-            text = chunk.text
-            if text:
-                full_response += text
-                if event_manager:
-                    event_manager.on_token(data={"chunk": text})
+
+            # Split parts into thinking vs answer (Gemini marks thoughts with part.thought=True)
+            for part in chunk.candidates[0].content.parts:
+                part_text = getattr(part, "text", "") or ""
+                if not part_text:
+                    continue
+                is_thought = getattr(part, "thought", False)
+                # Debug once: confirm whether thought flag is being set by Gemini
+                if enable_reasoning and not hasattr(handle_web_search_stream, "_logged_first_part"):
+                    logger.info(f"[WebSearch][debug] first part: thought={is_thought}, text_len={len(part_text)}, text_preview={part_text[:80]!r}")
+                    handle_web_search_stream._logged_first_part = True  # type: ignore[attr-defined]
+                if is_thought:
+                    full_reasoning += part_text
+                    if event_manager:
+                        event_manager.on_token(data={"chunk": part_text, "type": "reasoning"})
+                else:
+                    full_response += part_text
+                    if event_manager:
+                        event_manager.on_token(data={"chunk": part_text})
 
         if grounding_used:
             logger.info(f"[WebSearch] Google Search tool invoked. Queries: {search_queries}")
         else:
             logger.info("[WebSearch] No grounding metadata — model answered from its knowledge")
 
-        return {"response_text": full_response, "model_name": model_name}
+        return {
+            "response_text": full_response,
+            "reasoning_content": full_reasoning or None,
+            "model_name": model_name,
+        }
 
     except ValueError:
         raise
