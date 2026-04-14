@@ -1545,7 +1545,7 @@ async def orch_chat_stream(
     # -- 1. Route request ------------------------------------------------
     routing = await _route_request(session, current_user, body)
     mode = routing["mode"]
-    logger.info(f"[ORCH-STREAM] Routing mode={mode} intent={routing.get('intent')} session={body.session_id}")
+    logger.info(f"[ORCH-STREAM] Routing mode={mode} intent={routing.get('intent')} session={body.session_id} enable_reasoning={body.enable_reasoning} image_mode={body.image_mode}")
 
     # -- 2. For non-agent modes, use direct streaming --------------------
     if mode in ("model_direct", "web_search", "image_gen", "document_qa", "kb_search"):
@@ -1654,6 +1654,7 @@ async def orch_chat_stream(
                         _input_value,
                         system_message=get_system_identity_prompt(),
                         event_manager=event_manager,
+                        enable_reasoning=_enable_reasoning,
                     )
                 elif _mode == "image_gen":
                     from agentcore.services.mibuddy.image_gen_handler import handle_image_generation_stream
