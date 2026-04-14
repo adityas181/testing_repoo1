@@ -1325,6 +1325,7 @@ export default function AgentOrchestrator() {
         if (rafHandle !== null) { cancelAnimationFrame(rafHandle); rafHandle = null; }
         pendingContent = null;
         const reasoning = accumulatedReasoning || undefined;
+        console.warn("[Orch][flush] Setting msg with reasoningContent length:", reasoning?.length || 0, "content length:", content.length);
         flushSync(() => {
           setStreamingAgentName("");
           setMessages((prev) =>
@@ -1473,6 +1474,8 @@ export default function AgentOrchestrator() {
             updateAgentMsg(data?.text || "An error occurred", true);
             return false;
           } else if (eventType === "end") {
+            console.warn("[Orch][end event] reasoning_content length:", (data?.reasoning_content || "").length, "accumulated len:", accumulatedReasoning.length);
+            console.warn("[Orch][end event] reasoning preview:", (data?.reasoning_content || "").slice(0, 200));
             // Capture reasoning from end event if provided
             if (data?.reasoning_content) {
               accumulatedReasoning = data.reasoning_content;

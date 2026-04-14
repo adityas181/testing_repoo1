@@ -1658,7 +1658,11 @@ async def orch_chat_stream(
                         event_manager=event_manager,
                         enable_reasoning=_enable_reasoning,
                     )
-                    logger.warning(f"[ORCH-STREAM] <<< handle_web_search_stream RETURNED, reasoning_len={len(result.get('reasoning_content') or '')}, response_len={len(result.get('response_text') or '')}")
+                    _rc = result.get("reasoning_content") or ""
+                    _rt = result.get("response_text") or ""
+                    logger.warning(f"[ORCH-STREAM] <<< handle_web_search_stream RETURNED, reasoning_len={len(_rc)}, response_len={len(_rt)}")
+                    logger.warning(f"[ORCH-STREAM] REASONING preview: {_rc[:300]!r}")
+                    logger.warning(f"[ORCH-STREAM] RESPONSE preview: {_rt[:300]!r}")
                 elif _mode == "image_gen":
                     from agentcore.services.mibuddy.image_gen_handler import handle_image_generation_stream
                     result = await handle_image_generation_stream(
@@ -1694,6 +1698,7 @@ async def orch_chat_stream(
                     )
                     await orch_add_message(agent_msg, db)
 
+                logger.warning(f"[ORCH-STREAM] SENDING end event with reasoning_content len={len(reasoning_content or '')}, agent_text len={len(response_text or '')}")
                 event_manager.on_end(data={
                     "agent_text": response_text,
                     "message_id": str(agent_msg.id),
