@@ -26,6 +26,50 @@ import SharePointFilePicker from "./SharePointFilePicker";
 import OutlookConnector, { useOutlookStatus } from "./OutlookConnector";
 import NotebookLMPanel from "./NotebookLMPanel";
 import useAlertStore from "@/stores/alertStore";
+import openaiLogo from "@/assets/openai_logo.svg";
+import geminiLogo from "@/assets/gemini_logo.svg";
+import mistralLogo from "@/assets/mistral_logo.svg";
+import claudeLogo from "@/assets/claude_logo.svg";
+import azureLogo from "@/assets/azure_logo.svg";
+import metaLogo from "@/assets/meta_logo.svg";
+import cohereLogo from "@/assets/cohere_logo.svg";
+import perplexityLogo from "@/assets/perplexity_logo.svg";
+import nvidiaLogo from "@/assets/nvidia_logo.svg";
+import huggingfaceLogo from "@/assets/huggingface_logo.svg";
+import micoreLogo from "@/assets/micore.svg";
+import grokLogo from "@/assets/grok_logo.png";
+import nanoBananaLogo from "@/assets/nano_banana_logo.png";
+import dalleLogo from "@/assets/dalle_logo.svg";
+import googleLogo from "@/assets/google_logo.svg";
+import defaultLlmLogo from "@/assets/default_llm_logo.png";
+import notebookLMLogo from "@/assets/notebooklm_logo.svg";
+import translatorLogo from "@/assets/translator_logo.png";
+import imageLibraryLogo from "@/assets/image_library_logo.svg";
+import miNewChatIcon from "@/assets/mibuddy_new_chat.svg";
+import miSearchIcon from "@/assets/mibuddy_search.svg";
+import miChatHistoryIcon from "@/assets/mibuddy_chat_history.svg";
+import miArchiveIcon from "@/assets/mibuddy_archive.svg";
+import miInformationIcon from "@/assets/mibuddy_information.svg";
+import miHelpIcon from "@/assets/mibuddy_help.svg";
+
+// Sidebar mono icon: renders an SVG via CSS mask so it inherits the parent's text color.
+function SidebarMaskIcon({ src, className = "h-4 w-4 shrink-0 bg-muted-foreground" }: { src: string; className?: string }) {
+  return (
+    <span
+      className={className}
+      style={{
+        maskImage: `url(${src})`,
+        WebkitMaskImage: `url(${src})`,
+        maskSize: "contain",
+        WebkitMaskSize: "contain",
+        maskRepeat: "no-repeat",
+        WebkitMaskRepeat: "no-repeat",
+        maskPosition: "center",
+        WebkitMaskPosition: "center",
+      }}
+    />
+  );
+}
 
 /* ------------------ TYPES ------------------ */
 
@@ -207,26 +251,41 @@ function groupSessionsByDate(
 interface AiModelOption {
   id: string;
   name: string;
-  icon: string;        // color for the dot/icon
+  icon: string;        // image path (svg/png) for the model
   group: "main" | "more";
   capabilities?: Record<string, any>;
   is_default?: boolean;
 }
 
-// Provider → color mapping for model dots
-const PROVIDER_COLORS: Record<string, string> = {
-  openai: "#10a37f",
-  azure: "#0078d4",
-  anthropic: "#d97706",
-  google: "#4285f4",
-  google_vertex: "#34a853",
-  groq: "#f97316",
-  openai_compatible: "#6b7280",
-};
+// Resolve a model logo by matching id/name/provider against known patterns.
+function resolveModelIcon(model: { model_id?: string; model_name?: string; display_name?: string; provider?: string }): string {
+  const hay = `${model.model_id || ""} ${model.model_name || ""} ${model.display_name || ""}`.toLowerCase();
+  const provider = (model.provider || "").toLowerCase();
 
-function providerColor(provider: string): string {
-  return PROVIDER_COLORS[provider?.toLowerCase()] || "#6b7280";
+  if (/mibuddy|mi[\s_-]?core|micore/.test(hay)) return micoreLogo;
+  if (/dall[\s_-]?e/.test(hay)) return dalleLogo;
+  if (/grok/.test(hay)) return grokLogo;
+  if (/nano[\s_-]?banana/.test(hay)) return nanoBananaLogo;
+  if (/web[\s_-]?search|google[\s_-]?search/.test(hay)) return googleLogo;
+  if (/gemini|bard|palm/.test(hay)) return geminiLogo;
+  if (/mistral|mixtral/.test(hay)) return mistralLogo;
+  if (/claude|anthropic/.test(hay)) return claudeLogo;
+  if (/llama|meta/.test(hay)) return metaLogo;
+  if (/cohere|command[\s_-]?r/.test(hay)) return cohereLogo;
+  if (/perplexity|sonar/.test(hay)) return perplexityLogo;
+  if (/nvidia|nemotron/.test(hay)) return nvidiaLogo;
+  if (/hugging[\s_-]?face/.test(hay)) return huggingfaceLogo;
+  if (/gpt|openai|o1|o3|o4/.test(hay)) return openaiLogo;
+  if (/azure/.test(hay)) return azureLogo;
+
+  // Provider fallbacks
+  if (provider === "openai" || provider === "openai_compatible") return openaiLogo;
+  if (provider === "azure") return azureLogo;
+  if (provider === "anthropic") return claudeLogo;
+  if (provider === "google" || provider === "google_vertex") return geminiLogo;
+  return defaultLlmLogo;
 }
+
 
 // Empty default — models are fetched from API on mount
 const FALLBACK_AI_MODELS: AiModelOption[] = [];
@@ -676,7 +735,7 @@ export default function AgentOrchestrator() {
         const models: AiModelOption[] = data.map((m: any, idx: number) => ({
           id: m.model_id,
           name: m.display_name || m.model_name,
-          icon: providerColor(m.provider),
+          icon: resolveModelIcon(m),
           group: (idx < 5 ? "main" : "more") as "main" | "more",
           capabilities: m.capabilities || undefined,
           is_default: m.is_default || false,
@@ -764,6 +823,17 @@ export default function AgentOrchestrator() {
       setSelectedModelId(agents[0].id);
     }
   }, [agents, selectedModelId, noAgentMode]);
+
+  // Auto-disable COT when user switches to a non-Gemini model (or leaves model mode).
+  useEffect(() => {
+    if (!cotReasoning) return;
+    const current = aiModels.find((m) => m.id === selectedAiModel);
+    const modelName = (current?.name || "").toLowerCase();
+    const isGemini = /\b(gemini|google)\b/.test(modelName) && /\b(2\.5|3|3\.\d+)\b/.test(modelName);
+    if (!noAgentMode || !isGemini) {
+      setCotReasoning(false);
+    }
+  }, [selectedAiModel, noAgentMode, aiModels, cotReasoning]);
 
   // Update filteredAgents when agents load
   useEffect(() => {
@@ -1601,7 +1671,7 @@ export default function AgentOrchestrator() {
             }}
             className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
           >
-            <SquarePen size={16} className="shrink-0 text-muted-foreground" />
+            <SidebarMaskIcon src={miNewChatIcon} />
             <span>{t("New chat")}</span>
           </button>
 
@@ -1613,7 +1683,7 @@ export default function AgentOrchestrator() {
             }}
             className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
           >
-            <Search size={16} className="shrink-0 text-muted-foreground" />
+            <SidebarMaskIcon src={miSearchIcon} />
             <span>{t("Search chats")}</span>
           </button>
 
@@ -1699,7 +1769,7 @@ export default function AgentOrchestrator() {
             }}
             className={`flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent ${showImageGallery ? "bg-accent" : ""}`}
           >
-            <Image size={16} className="shrink-0 text-muted-foreground" />
+            <SidebarMaskIcon src={imageLibraryLogo} />
             <span>{t("Image")}</span>
           </button>
 
@@ -1708,7 +1778,7 @@ export default function AgentOrchestrator() {
             onClick={() => setShowChatHistoryExpand(!showChatHistoryExpand)}
             className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
           >
-            <Globe size={16} className="shrink-0 text-muted-foreground" />
+            <SidebarMaskIcon src={miChatHistoryIcon} />
             <span className="flex-1 text-left">{t("Chat history")}</span>
             <ChevronRight size={14} className={`text-muted-foreground transition-transform ${showChatHistoryExpand ? "rotate-90" : ""}`} />
           </button>
@@ -1763,7 +1833,7 @@ export default function AgentOrchestrator() {
             onClick={() => setShowArchiveChatExpand(!showArchiveChatExpand)}
             className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
           >
-            <Archive size={16} className="shrink-0 text-muted-foreground" />
+            <SidebarMaskIcon src={miArchiveIcon} />
             <span className="flex-1 text-left">{t("Archive Chat")}</span>
             <ChevronRight size={14} className={`text-muted-foreground transition-transform ${showArchiveChatExpand ? "rotate-90" : ""}`} />
           </button>
@@ -1822,14 +1892,14 @@ export default function AgentOrchestrator() {
               onClick={() => window.open("https://translator.motherson.com", "_blank")}
               className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
             >
-              <Globe size={16} className="shrink-0 text-blue-500" />
+              <img src={translatorLogo} alt="" className="h-4 w-4 shrink-0 object-contain" />
               <span>{t("AI Translator")}</span>
             </button>
             <button
               onClick={() => window.open("https://genai.motherson.com/do33", "_blank")}
               className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
             >
-              <Image size={16} className="shrink-0 text-green-500" />
+              <img src={imageLibraryLogo} alt="" className="h-4 w-4 shrink-0 object-contain" />
               <span>{t("DO33")}</span>
             </button>
             <button
@@ -1839,7 +1909,7 @@ export default function AgentOrchestrator() {
               }}
               className={`flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent ${showNotebookLM ? "bg-accent" : ""}`}
             >
-              <Headphones size={16} className="shrink-0 text-red-500" />
+              <img src={notebookLMLogo} alt="" className="h-4 w-4 shrink-0 object-contain" />
               <span>{t("NotebookLM")}</span>
             </button>
           </div>
@@ -1859,7 +1929,7 @@ export default function AgentOrchestrator() {
             }
             className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
           >
-            <Info size={16} className="shrink-0 text-muted-foreground" />
+            <SidebarMaskIcon src={miInformationIcon} />
             <span>{t("Information")}</span>
           </button>
           <button
@@ -1871,7 +1941,7 @@ export default function AgentOrchestrator() {
             }}
             className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
           >
-            <HelpCircle size={16} className="shrink-0 text-muted-foreground" />
+            <SidebarMaskIcon src={miHelpIcon} />
             <span>{t("Help")}</span>
           </button>
         </div>
@@ -1974,10 +2044,12 @@ export default function AgentOrchestrator() {
           <div className="my-1 h-px bg-border" />
           {(() => {
             const selectedModel = noAgentMode && selectedAiModel ? aiModels.find((m) => m.id === selectedAiModel) : null;
-            // supports_thinking = model can show visible reasoning/thinking text
-            // reasoning = model reasons internally (but may not show it, e.g. OpenAI o1/o3)
-            const modelSupportsReasoning = !!selectedModel?.capabilities?.supports_thinking;
-            const cotDisabled = noAgentMode && !modelSupportsReasoning;
+            // Restrict COT to Gemini models only (the only provider with reliable
+            // visible thinking support in our current setup). Matches names like
+            // "Gemini 3 Pro", "gemini-3.1-pro-preview", "Google 3.1 Pro", "Gemini 2.5 Flash".
+            const modelName = `${selectedModel?.name || ""}`.toLowerCase();
+            const isGeminiModel = /\b(gemini|google)\b/.test(modelName) && /\b(2\.5|3|3\.\d+)\b/.test(modelName);
+            const cotDisabled = noAgentMode && !isGeminiModel;
             return (
           <button
             onClick={() => { if (!cotDisabled) setCotReasoning(!cotReasoning); }}
@@ -2167,10 +2239,15 @@ export default function AgentOrchestrator() {
                 noAgentMode ? "text-foreground" : "text-muted-foreground"
               }`}
             >
-              <span
-                className="h-3 w-3 shrink-0 rounded-full"
-                style={{ background: noAgentMode && selectedAiModel ? aiModels.find((m) => m.id === selectedAiModel)?.icon || "#6b7280" : "#6b7280" }}
-              />
+              {noAgentMode && selectedAiModel && aiModels.find((m) => m.id === selectedAiModel)?.icon ? (
+                <img
+                  src={aiModels.find((m) => m.id === selectedAiModel)!.icon}
+                  alt=""
+                  className="h-4 w-4 shrink-0 object-contain"
+                />
+              ) : (
+                <span className="h-3 w-3 shrink-0 rounded-full bg-muted-foreground/40" />
+              )}
               <span>{noAgentMode && selectedAiModel ? aiModels.find((m) => m.id === selectedAiModel)?.name || t("Choose AI Model") : t("Choose AI Model")}</span>
               <ChevronDown size={14} className="opacity-50" />
             </button>
@@ -2197,9 +2274,10 @@ export default function AgentOrchestrator() {
                           : "text-foreground hover:bg-accent"
                     }`}
                   >
-                    <span
-                      className={`h-4 w-4 shrink-0 rounded-full ${!noAgentMode ? "opacity-30" : ""}`}
-                      style={{ background: model.icon }}
+                    <img
+                      src={model.icon}
+                      alt=""
+                      className={`h-5 w-5 shrink-0 object-contain ${!noAgentMode ? "opacity-30" : ""}`}
                     />
                     <span className="flex-1">{model.name}</span>
                     {noAgentMode && selectedAiModel === model.id && (
@@ -2241,9 +2319,10 @@ export default function AgentOrchestrator() {
                               : "text-foreground hover:bg-accent"
                           }`}
                         >
-                          <span
-                            className="h-4 w-4 shrink-0 rounded-full"
-                            style={{ background: model.icon }}
+                          <img
+                            src={model.icon}
+                            alt=""
+                            className="h-5 w-5 shrink-0 object-contain"
                           />
                           <span className="flex-1">{model.name}</span>
                           {selectedAiModel === model.id && (
@@ -2355,16 +2434,18 @@ export default function AgentOrchestrator() {
                       </div>
                     ) : (
                       <div className="text-[15px] leading-relaxed text-foreground/80">
-                        {/* CoT Reasoning (collapsible) */}
-                        {cotReasoning && msg.reasoningContent && (
-                          <details className="mb-3 rounded-lg border border-border bg-muted/30 p-3" open={isSending && msg.id === streamingMsgId}>
-                            <summary className="cursor-pointer text-xs font-medium text-muted-foreground hover:text-foreground">
-                              💭 {t("Thinking")}
+                        {/* CoT Reasoning — MiBuddy-style pill + collapsible panel */}
+                        {msg.reasoningContent && (
+                          <details className="mb-3 group" open={isSending && msg.id === streamingMsgId}>
+                            <summary className="inline-flex cursor-pointer list-none items-center gap-2 rounded-full border border-border bg-muted/50 px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted [&::-webkit-details-marker]:hidden">
+                              <Lightbulb size={16} className="text-yellow-500" />
+                              <span>{t("Reasoning")}</span>
                               {isSending && msg.id === streamingMsgId && (
-                                <span className="ml-2 text-xs text-muted-foreground/60">({t("streaming...")})</span>
+                                <Loader2 size={12} className="animate-spin text-muted-foreground" />
                               )}
+                              <ChevronDown size={14} className="text-muted-foreground transition-transform group-open:rotate-180" />
                             </summary>
-                            <div className="mt-2 whitespace-pre-wrap text-xs leading-relaxed text-muted-foreground">
+                            <div className="mt-3 whitespace-pre-wrap rounded-lg border border-border bg-muted/20 p-4 text-sm leading-relaxed text-muted-foreground">
                               {msg.reasoningContent}
                             </div>
                           </details>
@@ -2689,6 +2770,21 @@ export default function AgentOrchestrator() {
                     <span className="text-xs font-semibold text-red-500">{t("Image")}</span>
                     <button
                       onClick={() => setImageMode(false)}
+                      className="ml-0.5 rounded-full p-0.5 text-red-400 hover:bg-red-100 hover:text-red-600 dark:hover:bg-red-900/50"
+                    >
+                      <X size={10} />
+                    </button>
+                  </div>
+                </div>
+              )}
+              {/* COT reasoning pill */}
+              {cotReasoning && (
+                <div className="flex items-center px-4 pb-1">
+                  <div className="inline-flex items-center gap-1.5 rounded-full border border-red-200 bg-red-50 px-3 py-1 dark:border-red-800 dark:bg-red-950/30">
+                    <Lightbulb size={12} className="text-red-500" />
+                    <span className="text-xs font-semibold text-red-500">{t("COT")}</span>
+                    <button
+                      onClick={() => setCotReasoning(false)}
                       className="ml-0.5 rounded-full p-0.5 text-red-400 hover:bg-red-100 hover:text-red-600 dark:hover:bg-red-900/50"
                     >
                       <X size={10} />
