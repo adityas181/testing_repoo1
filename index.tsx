@@ -71,6 +71,82 @@ function SidebarMaskIcon({ src, className = "h-4 w-4 shrink-0 bg-muted-foregroun
   );
 }
 
+/* ------------------ REASONING BLOCK (CoT display) ------------------ */
+
+function ReasoningBlock({
+  reasoning,
+  streaming,
+  msgId,
+}: {
+  reasoning: string;
+  streaming: boolean;
+  msgId: string;
+}) {
+  const [open, setOpen] = useState(streaming);
+  // Re-open while streaming; user can manually toggle after streaming stops
+  useEffect(() => {
+    if (streaming) setOpen(true);
+  }, [streaming]);
+
+  console.warn("[ReasoningBlock] rendering for msg", msgId, "length:", reasoning?.length, "open:", open);
+
+  return (
+    <div
+      style={{
+        marginBottom: "12px",
+        width: "100%",
+      }}
+    >
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        style={{
+          display: "inline-flex",
+          alignItems: "center",
+          gap: "8px",
+          padding: "8px 16px",
+          borderRadius: "9999px",
+          border: "1px solid #e5e7eb",
+          background: "#f9fafb",
+          fontSize: "14px",
+          fontWeight: 500,
+          cursor: "pointer",
+          color: "#374151",
+        }}
+      >
+        <Lightbulb size={16} style={{ color: "#eab308" }} />
+        <span>Reasoning</span>
+        {streaming && <Loader2 size={12} className="animate-spin" style={{ color: "#6b7280" }} />}
+        <ChevronDown
+          size={14}
+          style={{
+            color: "#6b7280",
+            transform: open ? "rotate(180deg)" : "rotate(0deg)",
+            transition: "transform 0.2s",
+          }}
+        />
+      </button>
+      {open && (
+        <div
+          style={{
+            marginTop: "12px",
+            padding: "16px",
+            borderRadius: "8px",
+            border: "1px solid #e5e7eb",
+            background: "#f9fafb",
+            fontSize: "13px",
+            lineHeight: "1.6",
+            color: "#4b5563",
+            whiteSpace: "pre-wrap",
+          }}
+        >
+          {reasoning}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ------------------ TYPES ------------------ */
 
 interface Agent {
@@ -2437,52 +2513,13 @@ export default function AgentOrchestrator() {
                       </div>
                     ) : (
                       <div className="text-[15px] leading-relaxed text-foreground/80">
-                        {/* CoT Reasoning — MiBuddy-style pill + collapsible panel */}
-                        {(() => {
-                          const hasReasoning = !!msg.reasoningContent;
-                          if (hasReasoning) {
-                            console.warn("[Orch][render] RENDERING reasoning pill for msg", msg.id, "length:", msg.reasoningContent?.length);
-                          }
-                          return hasReasoning;
-                        })() && (
-                          <div className="mb-3">
-                            <details open={isSending && msg.id === streamingMsgId} style={{ display: "block" }}>
-                              <summary
-                                style={{
-                                  display: "inline-flex",
-                                  alignItems: "center",
-                                  gap: "8px",
-                                  padding: "8px 16px",
-                                  borderRadius: "9999px",
-                                  border: "1px solid #e5e7eb",
-                                  background: "#f9fafb",
-                                  fontSize: "14px",
-                                  fontWeight: 500,
-                                  cursor: "pointer",
-                                  listStyle: "none",
-                                }}
-                              >
-                                <Lightbulb size={16} style={{ color: "#eab308" }} />
-                                <span>{t("Reasoning")}</span>
-                                <ChevronDown size={14} style={{ color: "#6b7280" }} />
-                              </summary>
-                              <div
-                                style={{
-                                  marginTop: "12px",
-                                  padding: "16px",
-                                  borderRadius: "8px",
-                                  border: "1px solid #e5e7eb",
-                                  background: "#f9fafb",
-                                  fontSize: "14px",
-                                  lineHeight: "1.6",
-                                  color: "#6b7280",
-                                  whiteSpace: "pre-wrap",
-                                }}
-                              >
-                                {msg.reasoningContent}
-                              </div>
-                            </details>
-                          </div>
+                        {/* CoT Reasoning — plain div-based (no details/summary) */}
+                        {msg.reasoningContent && (
+                          <ReasoningBlock
+                            reasoning={msg.reasoningContent}
+                            streaming={isSending && msg.id === streamingMsgId}
+                            msgId={msg.id}
+                          />
                         )}
                         {msg.contentBlocks && msg.contentBlocks.length > 0 && (
                           <ContentBlockDisplay
