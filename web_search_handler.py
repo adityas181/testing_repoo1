@@ -166,18 +166,33 @@ async def handle_web_search_stream(query: str, system_message: str = "", event_m
             ],
             "tools": tools,
         }
-        # Enable visible thinking for Gemini 2.5+ / 3.x
+        # Enable visible thinking. Gemini 3.x uses thinking_level ("LOW"/"MEDIUM"/"HIGH");
+        # Gemini 2.5 uses thinking_budget (int). Try the new API first, then fallback.
         if enable_reasoning:
+            is_gemini_3 = "gemini-3" in (model_name or "").lower()
+            thinking_config = None
             try:
-                # thinking_budget=-1 enables dynamic thinking (model decides how much).
-                # Some SDK versions need thinking_budget along with include_thoughts.
-                config_kwargs["thinking_config"] = types.ThinkingConfig(
-                    include_thoughts=True,
-                    thinking_budget=-1,
-                )
-                logger.info(f"[WebSearch] enable_reasoning=True — attached ThinkingConfig(include_thoughts=True)")
+                if is_gemini_3:
+                    # Gemini 3.x API
+                    thinking_config = types.ThinkingConfig(
+                        thinking_level="HIGH",
+                        include_thoughts=True,
+                    )
+                else:
+                    # Gemini 2.5 API (thinking_budget=-1 = dynamic)
+                    thinking_config = types.ThinkingConfig(
+                        thinking_budget=-1,
+                        include_thoughts=True,
+                    )
+                config_kwargs["thinking_config"] = thinking_config
+                logger.info(f"[WebSearch] enable_reasoning=True — attached {thinking_config!r}")
             except (AttributeError, TypeError) as e:
-                logger.warning(f"[WebSearch] ThinkingConfig not supported: {e}")
+                # Fallback: try with only include_thoughts
+                try:
+                    config_kwargs["thinking_config"] = types.ThinkingConfig(include_thoughts=True)
+                    logger.info(f"[WebSearch] Fell back to ThinkingConfig(include_thoughts=True): {e}")
+                except (AttributeError, TypeError) as e2:
+                    logger.warning(f"[WebSearch] ThinkingConfig not supported at all: {e2}")
         else:
             logger.info(f"[WebSearch] enable_reasoning=False — no thinking config")
         config = types.GenerateContentConfig(**config_kwargs)
