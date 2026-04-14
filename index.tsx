@@ -76,11 +76,9 @@ function SidebarMaskIcon({ src, className = "h-4 w-4 shrink-0 bg-muted-foregroun
 function ReasoningBlock({
   reasoning,
   streaming,
-  msgId,
 }: {
   reasoning: string;
   streaming: boolean;
-  msgId: string;
 }) {
   const [open, setOpen] = useState(streaming);
   // Re-open while streaming; user can manually toggle after streaming stops
@@ -88,19 +86,11 @@ function ReasoningBlock({
     if (streaming) setOpen(true);
   }, [streaming]);
 
-  console.warn("[ReasoningBlock] rendering for msg", msgId, "length:", reasoning?.length, "open:", open);
-
   return (
     <div
       style={{
         marginBottom: "12px",
         width: "100%",
-        border: "3px solid red",      // DEBUG: visibility test
-        padding: "8px",                // DEBUG: visibility test
-        background: "#fef2f2",         // DEBUG: visibility test
-        minHeight: "60px",             // DEBUG: visibility test
-        position: "relative",          // DEBUG: ensure positioning context
-        zIndex: 10,                    // DEBUG: ensure on top
       }}
     >
       <button
@@ -2519,14 +2509,11 @@ export default function AgentOrchestrator() {
                       </div>
                     ) : (
                       <div className="text-[15px] leading-relaxed text-foreground/80">
-                        {/* DEBUG: unique marker that will appear in DOM if this branch renders */}
-                        <div data-debug-marker={`REASONING_BRANCH_${msg.id}`}>__BRANCH_OK__</div>
-                        {/* CoT Reasoning — plain div-based (no details/summary) */}
-                        {Boolean(msg.reasoningContent) && (
+                        {/* CoT Reasoning — collapsible pill + panel */}
+                        {msg.reasoningContent && (
                           <ReasoningBlock
-                            reasoning={msg.reasoningContent!}
+                            reasoning={msg.reasoningContent}
                             streaming={isSending && msg.id === streamingMsgId}
-                            msgId={msg.id}
                           />
                         )}
                         {msg.contentBlocks && msg.contentBlocks.length > 0 && (

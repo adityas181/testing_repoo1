@@ -2037,6 +2037,8 @@ async def get_orch_session_messages(
                 text=m.text,
                 agent_id=m.agent_id,
                 deployment_id=m.deployment_id,
+                model_id=getattr(m, "model_id", None),
+                reasoning_content=getattr(m, "reasoning_content", None),
                 category=m.category or "message",
                 files=m.files if m.files else None,
                 properties=m.properties if isinstance(m.properties, dict) else None,
