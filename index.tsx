@@ -2438,20 +2438,51 @@ export default function AgentOrchestrator() {
                     ) : (
                       <div className="text-[15px] leading-relaxed text-foreground/80">
                         {/* CoT Reasoning — MiBuddy-style pill + collapsible panel */}
-                        {msg.reasoningContent && (
-                          <details className="mb-3 group" open={isSending && msg.id === streamingMsgId}>
-                            <summary className="inline-flex cursor-pointer list-none items-center gap-2 rounded-full border border-border bg-muted/50 px-4 py-2 text-sm font-medium text-foreground transition-colors hover:bg-muted [&::-webkit-details-marker]:hidden">
-                              <Lightbulb size={16} className="text-yellow-500" />
-                              <span>{t("Reasoning")}</span>
-                              {isSending && msg.id === streamingMsgId && (
-                                <Loader2 size={12} className="animate-spin text-muted-foreground" />
-                              )}
-                              <ChevronDown size={14} className="text-muted-foreground transition-transform group-open:rotate-180" />
-                            </summary>
-                            <div className="mt-3 whitespace-pre-wrap rounded-lg border border-border bg-muted/20 p-4 text-sm leading-relaxed text-muted-foreground">
-                              {msg.reasoningContent}
-                            </div>
-                          </details>
+                        {(() => {
+                          const hasReasoning = !!msg.reasoningContent;
+                          if (hasReasoning) {
+                            console.warn("[Orch][render] RENDERING reasoning pill for msg", msg.id, "length:", msg.reasoningContent?.length);
+                          }
+                          return hasReasoning;
+                        })() && (
+                          <div className="mb-3">
+                            <details open={isSending && msg.id === streamingMsgId} style={{ display: "block" }}>
+                              <summary
+                                style={{
+                                  display: "inline-flex",
+                                  alignItems: "center",
+                                  gap: "8px",
+                                  padding: "8px 16px",
+                                  borderRadius: "9999px",
+                                  border: "1px solid #e5e7eb",
+                                  background: "#f9fafb",
+                                  fontSize: "14px",
+                                  fontWeight: 500,
+                                  cursor: "pointer",
+                                  listStyle: "none",
+                                }}
+                              >
+                                <Lightbulb size={16} style={{ color: "#eab308" }} />
+                                <span>{t("Reasoning")}</span>
+                                <ChevronDown size={14} style={{ color: "#6b7280" }} />
+                              </summary>
+                              <div
+                                style={{
+                                  marginTop: "12px",
+                                  padding: "16px",
+                                  borderRadius: "8px",
+                                  border: "1px solid #e5e7eb",
+                                  background: "#f9fafb",
+                                  fontSize: "14px",
+                                  lineHeight: "1.6",
+                                  color: "#6b7280",
+                                  whiteSpace: "pre-wrap",
+                                }}
+                              >
+                                {msg.reasoningContent}
+                              </div>
+                            </details>
+                          </div>
                         )}
                         {msg.contentBlocks && msg.contentBlocks.length > 0 && (
                           <ContentBlockDisplay
