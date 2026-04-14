@@ -169,7 +169,19 @@ async def handle_web_search_stream(query: str, system_message: str = "", event_m
         # Enable visible thinking. Gemini 3.x uses thinking_level ("LOW"/"MEDIUM"/"HIGH");
         # Gemini 2.5 uses thinking_budget (int). Try the new API first, then fallback.
         if enable_reasoning:
-            is_gemini_3 = "gemini-3" in (model_name or "").lower()
+            # Extract major version from any naming style:
+            #   "gemini-3.1-pro-preview", "Gemini 3 Pro", "gemini_3_pro",
+            #   "google-3.1", "Gemini 3.2 Ultra" → all detected as major version 3.
+            import re as _re
+            version_match = _re.search(r"(?:gemini|google)[\s_\-]*(\d+(?:\.\d+)?)", (model_name or "").lower())
+            major_version = 0.0
+            if version_match:
+                try:
+                    major_version = float(version_match.group(1))
+                except ValueError:
+                    major_version = 0.0
+            is_gemini_3 = major_version >= 3.0
+            logger.info(f"[WebSearch] model_name={model_name!r}, detected version={major_version}, using new API={is_gemini_3}")
             thinking_config = None
             try:
                 if is_gemini_3:

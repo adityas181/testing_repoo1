@@ -28,9 +28,12 @@ KNOWN_MODEL_HINTS: dict[str, str] = {
 
 def _hint_for(display_name: str) -> str | None:
     """Return the hardcoded MiBuddy hint matching this model's display_name, or None."""
-    name = display_name.lower()
+    # Normalize spaces/hyphens/underscores so "GPT 5.2", "gpt-5.2", "GPT_5.2" all match
+    def _norm(s: str) -> str:
+        return (s or "").lower().replace("_", "").replace("-", "").replace(" ", "")
+    name_norm = _norm(display_name)
     for key, hint in KNOWN_MODEL_HINTS.items():
-        if key in name:
+        if _norm(key) in name_norm:
             return hint
     return None
 
