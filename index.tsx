@@ -95,6 +95,12 @@ function ReasoningBlock({
       style={{
         marginBottom: "12px",
         width: "100%",
+        border: "3px solid red",      // DEBUG: visibility test
+        padding: "8px",                // DEBUG: visibility test
+        background: "#fef2f2",         // DEBUG: visibility test
+        minHeight: "60px",             // DEBUG: visibility test
+        position: "relative",          // DEBUG: ensure positioning context
+        zIndex: 10,                    // DEBUG: ensure on top
       }}
     >
       <button
@@ -2514,9 +2520,14 @@ export default function AgentOrchestrator() {
                     ) : (
                       <div className="text-[15px] leading-relaxed text-foreground/80">
                         {/* CoT Reasoning — plain div-based (no details/summary) */}
-                        {msg.reasoningContent && (
+                        {(() => {
+                          if (msg.reasoningContent) {
+                            console.warn("[Orch][render] RENDERING reasoning pill for msg", msg.id, "length:", msg.reasoningContent?.length);
+                          }
+                          return msg.reasoningContent;
+                        })() && (
                           <ReasoningBlock
-                            reasoning={msg.reasoningContent}
+                            reasoning={msg.reasoningContent!}
                             streaming={isSending && msg.id === streamingMsgId}
                             msgId={msg.id}
                           />
