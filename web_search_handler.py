@@ -214,11 +214,15 @@ async def handle_web_search_stream(query: str, system_message: str = "", event_m
         full_reasoning = ""
         grounding_used = False
         search_queries: list[str] = []
+        chunk_count = 0
+        answer_chunk_count = 0
+        reasoning_chunk_count = 0
         for chunk in client.models.generate_content_stream(
             model=model_name,
             contents=contents,
             config=config,
         ):
+            chunk_count += 1
             if not chunk.candidates or not chunk.candidates[0].content or not chunk.candidates[0].content.parts:
                 continue
             # Log grounding metadata (confirms Google Search tool was invoked)
@@ -241,14 +245,17 @@ async def handle_web_search_stream(query: str, system_message: str = "", event_m
                     logger.info(f"[WebSearch][debug] first part: thought={is_thought}, text_len={len(part_text)}, text_preview={part_text[:80]!r}")
                     handle_web_search_stream._logged_first_part = True  # type: ignore[attr-defined]
                 if is_thought:
+                    reasoning_chunk_count += 1
                     full_reasoning += part_text
                     if event_manager:
                         event_manager.on_token(data={"chunk": part_text, "type": "reasoning"})
                 else:
+                    answer_chunk_count += 1
                     full_response += part_text
                     if event_manager:
                         event_manager.on_token(data={"chunk": part_text})
 
+        logger.info(f"[WebSearch] Stream stats: total_chunks={chunk_count}, reasoning_parts={reasoning_chunk_count}, answer_parts={answer_chunk_count}")
         if grounding_used:
             logger.info(f"[WebSearch] Google Search tool invoked. Queries: {search_queries}")
         else:

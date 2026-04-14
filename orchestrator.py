@@ -1427,7 +1427,12 @@ async def orch_chat(
             result = await handle_web_search(body.input_value, system_message=get_system_identity_prompt())
             response_text = result["response_text"]
             resp_model_name = result.get("model_name", "gemini")
-            sender_name = "Web Search"
+            # If user explicitly picked the model → show its name.
+            # If intent classifier decided → show generic "Web Search".
+            if routing.get("intent") == "web_search_explicit" and resp_model_id:
+                sender_name = await _get_model_display_name(session, resp_model_id)
+            else:
+                sender_name = "Web Search"
 
         elif mode == "image_gen":
             from agentcore.services.mibuddy.image_gen_handler import handle_image_generation
@@ -1438,7 +1443,12 @@ async def orch_chat(
             )
             response_text = result["response_text"]
             resp_model_name = result.get("model_name", "image-generation")
-            sender_name = "Image Generator"
+            # If user explicitly picked the model → show its name.
+            # If intent classifier decided → show generic "Image Generator".
+            if routing.get("intent") == "image_generation_explicit" and resp_model_id:
+                sender_name = await _get_model_display_name(session, resp_model_id)
+            else:
+                sender_name = "Image Generator"
 
         elif mode == "document_qa":
             from agentcore.services.mibuddy.document_processor import process_and_ingest, search_documents, build_doc_qa_prompt
@@ -1569,6 +1579,7 @@ async def orch_chat_stream(
         await orch_add_message(user_msg, session)
 
         resp_model_id = routing.get("model_id")
+        intent = routing.get("intent")
         sender_name = "Assistant"
         if mode in ("model_direct", "document_qa") and resp_model_id:
             sender_name = await _get_model_display_name(session, resp_model_id)
@@ -1576,9 +1587,18 @@ async def orch_chat_stream(
             settings_svc = get_settings_service()
             sender_name = settings_svc.settings.company_kb_name or "Knowledge Base"
         elif mode == "web_search":
-            sender_name = "Web Search"
+            # If user explicitly picked a web-search-capable model → show its name.
+            # If intent classifier decided → show generic "Web Search".
+            if intent == "web_search_explicit" and resp_model_id:
+                sender_name = await _get_model_display_name(session, resp_model_id)
+            else:
+                sender_name = "Web Search"
         elif mode == "image_gen":
-            sender_name = "Image Generator"
+            # Same pattern: explicit selection shows model name, intent-driven shows generic label.
+            if intent == "image_generation_explicit" and resp_model_id:
+                sender_name = await _get_model_display_name(session, resp_model_id)
+            else:
+                sender_name = "Image Generator"
 
         queue: asyncio.Queue = asyncio.Queue()
         event_manager = create_default_event_manager(queue)
