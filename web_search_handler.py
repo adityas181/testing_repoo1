@@ -137,6 +137,7 @@ async def handle_web_search_stream(query: str, system_message: str = "", event_m
     When enable_reasoning=True, Gemini 2.5+/3.x emits thought summaries alongside
     the answer via thinking_config.include_thoughts.
     """
+    logger.info(f"[WebSearch] handle_web_search_stream CALLED with enable_reasoning={enable_reasoning}, query={query[:50]!r}")
     from google import genai
     from google.genai import types
 
