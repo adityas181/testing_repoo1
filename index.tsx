@@ -1,6 +1,6 @@
 import { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
-import { Send, Sparkles, ChevronDown, Plus, MessageSquare, PanelLeftClose, PanelLeft, User, Loader2, Trash2, Check, ImagePlus, X, Clock, Search, Image, Archive, ChevronRight, Globe, BookOpen, Headphones, Info, HelpCircle, Mic, AudioLines, FileUp, Paintbrush, Lightbulb, Upload, MoreVertical, Folder, ArrowLeft, File, FileText, Shield, CheckCircle2, SquarePen, Mail, Download, Copy } from "lucide-react";
+import { Send, Sparkles, ChevronDown, Plus, MessageSquare, PanelLeftClose, PanelLeft, User, Loader2, Trash2, Check, ImagePlus, X, Clock, Search, Image, Archive, ChevronRight, Globe, BookOpen, Headphones, Info, HelpCircle, Mic, AudioLines, FileUp, Paintbrush, Lightbulb, Upload, MoreVertical, Folder, ArrowLeft, File, FileText, Shield, CheckCircle2, SquarePen, Mail, Download, Copy, Pencil } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import {
   useGetOrchAgents,
@@ -23,8 +23,13 @@ import { MarkdownField } from "@/modals/IOModal/components/chatView/chatMessage/
 import { ContentBlockDisplay } from "@/components/core/chatComponents/ContentBlockDisplay";
 import type { ContentBlock } from "@/types/chat";
 import SharePointFilePicker from "./SharePointFilePicker";
-import OutlookConnector, { useOutlookStatus } from "./OutlookConnector";
+// OutlookConnector removed — replaced by OutlookOrchConnector below.
 import NotebookLMPanel from "./NotebookLMPanel";
+import OutlookOrchConnector, {
+  useOutlookOrchStatus,
+  disconnectOutlookOrch,
+} from "./OutlookOrchConnector";
+import CanvasEditor from "./CanvasEditor";
 import useAlertStore from "@/stores/alertStore";
 import openaiLogo from "@/assets/openai_logo.svg";
 import geminiLogo from "@/assets/gemini_logo.svg";
@@ -44,29 +49,33 @@ import googleLogo from "@/assets/google_logo.svg";
 import defaultLlmLogo from "@/assets/default_llm_logo.png";
 import notebookLMLogo from "@/assets/notebooklm_logo.svg";
 import translatorLogo from "@/assets/translator_logo.png";
-import imageLibraryLogo from "@/assets/image_library_logo.svg";
-import miNewChatIcon from "@/assets/mibuddy_new_chat.svg";
-import miSearchIcon from "@/assets/mibuddy_search.svg";
-import miChatHistoryIcon from "@/assets/mibuddy_chat_history.svg";
-import miArchiveIcon from "@/assets/mibuddy_archive.svg";
-import miInformationIcon from "@/assets/mibuddy_information.svg";
-import miHelpIcon from "@/assets/mibuddy_help.svg";
+// `?url` forces vite-plugin-svgr to give us a URL string (instead of a
+// React component) so these icons can be used as CSS `mask-image` via
+// <SidebarMaskIcon>. Without ?url the import resolves to a component
+// and `url(${src})` becomes invalid → masks silently drop → icons look
+// like plain filled squares.
+import imageLibraryLogo from "@/assets/image_library_logo.svg?url";
+import miNewChatIcon from "@/assets/mibuddy_new_chat.svg?url";
+import miSearchIcon from "@/assets/mibuddy_search.svg?url";
+import miChatHistoryIcon from "@/assets/mibuddy_chat_history.svg?url";
+import miArchiveIcon from "@/assets/mibuddy_archive.svg?url";
+import miInformationIcon from "@/assets/mibuddy_information.svg?url";
+import miHelpIcon from "@/assets/mibuddy_help.svg?url";
 
-// Sidebar mono icon: renders an SVG via CSS mask so it inherits the parent's text color.
-function SidebarMaskIcon({ src, className = "h-4 w-4 shrink-0 bg-muted-foreground" }: { src: string; className?: string }) {
+// Sidebar icon renderer. Uses a plain <img> (same pattern that works for
+// the Applications section icons). The previous CSS-mask approach silently
+// failed because the Vite SVG import pipeline can resolve the default
+// export as a React component instead of a URL string, making
+// `mask-image: url(${src})` invalid and causing the <span> to show as a
+// solid colored rectangle. <img> handles both default-URL and
+// component-as-string cases more forgivingly, and the `invert`/`opacity`
+// filters below keep the icons visually muted in both themes.
+function SidebarMaskIcon({ src, className = "h-4 w-4 shrink-0" }: { src: string; className?: string }) {
   return (
-    <span
-      className={className}
-      style={{
-        maskImage: `url(${src})`,
-        WebkitMaskImage: `url(${src})`,
-        maskSize: "contain",
-        WebkitMaskSize: "contain",
-        maskRepeat: "no-repeat",
-        WebkitMaskRepeat: "no-repeat",
-        maskPosition: "center",
-        WebkitMaskPosition: "center",
-      }}
+    <img
+      src={src}
+      alt=""
+      className={`${className} opacity-80 object-contain dark:invert`}
     />
   );
 }
@@ -174,6 +183,9 @@ interface Message {
   hitlActions?: string[];
   hitlThreadId?: string;
   hitlIsDeployed?: boolean;
+  // Canvas mode (MiBuddy-style) — if true, agent responses render in the
+  // editable CanvasEditor card rather than as a plain MarkdownField.
+  canvasEnabled?: boolean;
 }
 
 interface FilePreview {
@@ -267,6 +279,10 @@ function mapApiMessages(apiMessages: OrchMessageResponse[]): Message[] {
       files: m.files && m.files.length > 0 ? m.files : undefined,
       contentBlocks: toolBlocks.length > 0 ? toolBlocks : undefined,
       blocksState: toolBlocks.length > 0 ? "complete" : undefined,
+      // Restore canvas flag so the editable CanvasEditor renders after
+      // a refetch / reload. Persisted in the message's `properties` JSON
+      // by the backend when canvas was on.
+      canvasEnabled: !!props?.canvas_enabled,
       // Restore HITL metadata from persisted properties.
       // Fallback to text inference because some interrupted rows may miss fields.
       hitl: isHitl,
@@ -552,6 +568,9 @@ export default function AgentOrchestrator() {
   // Addon: Image gallery view (replaces chat area when active)
   const [showImageGallery, setShowImageGallery] = useState(false);
   const [showNotebookLM, setShowNotebookLM] = useState(false);
+  const [showOutlookOrch, setShowOutlookOrch] = useState(false);
+  const { isOutlookConnected: isOutlookOrchConnected, setIsOutlookConnected: setIsOutlookOrchConnected } =
+    useOutlookOrchStatus();
   const [selectedGalleryImage, setSelectedGalleryImage] = useState<{ src: string; name: string } | null>(null);
   // Addon: Canvas mode
   const [isCanvasEnabled, setIsCanvasEnabled] = useState(false);
@@ -570,9 +589,9 @@ export default function AgentOrchestrator() {
   // Addon: Speech-to-Text (mic)
   const [isListening, setIsListening] = useState(false);
   const recognitionRef = useRef<any>(null);
-  // Addon: Outlook connector
-  const [outlookDialogOpen, setOutlookDialogOpen] = useState(false);
-  const { isConnected: isOutlookConnected, refresh: refreshOutlookStatus, setIsConnected: setOutlookConnected } = useOutlookStatus();
+  // Outlook connector state moved to useOutlookOrchStatus (see OutlookOrchConnector).
+  // Kept these stub locals so refs from older code paths still compile; they
+  // are not connected to anything.
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -765,24 +784,32 @@ export default function AgentOrchestrator() {
         return;
       }
       const mapped = mapApiMessages(apiSessionMessages);
-      // Preserve local-only state that the API may not return:
-      //   - contentBlocks (agent worker-node "Finished" thinking blocks)
-      //   - reasoningContent (CoT thinking from streaming, in case API filtered)
-      // The API is the source of truth for everything else.
+      // Preserve canvas state on refetch — the mapper reads it from
+      // `properties.canvas_enabled` in the DB, but if a message was
+      // already flagged in-memory we keep that flag even if the DB
+      // didn't persist it (e.g. backend restart mid-stream).
       setMessages((prev) => {
-        if (prev.length === 0) return mapped;
-        const localById = new Map(prev.map((m) => [m.id, m]));
+        const prevCanvasIds: Record<string, boolean> = {};
+        const prevById = new Map<string, Message>();
+        prev.forEach((m) => {
+          if (m.canvasEnabled) prevCanvasIds[m.id] = true;
+          prevById.set(m.id, m);
+        });
         return mapped.map((m) => {
-          const local = localById.get(m.id);
-          if (!local) return m;
-          return {
-            ...m,
-            // Keep local contentBlocks if API didn't return any (agent thinking)
-            contentBlocks: m.contentBlocks ?? local.contentBlocks,
-            blocksState: m.contentBlocks ? m.blocksState : (local.blocksState ?? m.blocksState),
-            // Keep local reasoningContent if API didn't return any
-            reasoningContent: m.reasoningContent ?? local.reasoningContent,
-          };
+          const local = prevById.get(m.id);
+          // Existing canvas preservation
+          let merged = prevCanvasIds[m.id] ? { ...m, canvasEnabled: true } : m;
+          // Also preserve contentBlocks (agent worker-node "Finished" blocks)
+          // and reasoningContent (CoT thinking) if API didn't return them
+          if (local) {
+            merged = {
+              ...merged,
+              contentBlocks: merged.contentBlocks ?? local.contentBlocks,
+              blocksState: merged.contentBlocks ? merged.blocksState : (local.blocksState ?? merged.blocksState),
+              reasoningContent: merged.reasoningContent ?? local.reasoningContent,
+            };
+          }
+          return merged;
         });
       });
       setCurrentSessionId(effectiveSessionId);
@@ -1079,8 +1106,11 @@ export default function AgentOrchestrator() {
 
   const handleInputChange = (value: string) => {
     setInput(value);
+    // Allow @-mentions in BOTH model mode and agent mode. If the user is in
+    // model mode and picks an agent, `handleSelectAgent` below will flip
+    // them into agent mode automatically.
     const match = value.match(/@([\w\s().-]*)$/);
-    if (match && !noAgentMode) {
+    if (match && agents.length > 0) {
       const query = match[1].toLowerCase();
       setFilteredAgents(agents.filter((a) => a.name.toLowerCase().includes(query)));
       setShowMentions(true);
@@ -1124,6 +1154,10 @@ export default function AgentOrchestrator() {
     const updated = input.replace(/@[\w\s().-]*$/, `@${agent.name} `);
     setInput(updated);
     setSelectedModelId(agent.id);
+    // If the user was in model mode and just @-mentioned an agent, flip
+    // them into agent mode so the model picker disables and the send
+    // goes to the agent runtime.
+    if (noAgentMode) setNoAgentMode(false);
     setShowMentions(false);
     textareaRef.current?.focus();
   };
@@ -1278,6 +1312,12 @@ export default function AgentOrchestrator() {
     const hasFiles = uploadFiles.some((f) => f.path && !f.loading && !f.error);
     if (!canInteract || (!input.trim() && !hasFiles) || isSending) return;
 
+    // Outlook intent handling moved to the backend: the MiBuddy-ported
+    // intent classifier now returns "outlook_query" for email/calendar
+    // queries, and the orchestrator's chat-stream handler invokes
+    // outlook_agent_node which renders the reply. No frontend precheck
+    // needed — normal send path handles everything.
+
     // Detect explicit @mention — auto-select the agent if user typed @agent_name
     // Sort by name length descending so "rag agent_new" matches before "rag agent".
     const explicitAgent = [...agents]
@@ -1365,6 +1405,7 @@ export default function AgentOrchestrator() {
           agentName: responderName,
           content: "",  // empty = "Thinking..." state
           timestamp: timeNow(),
+          canvasEnabled: isCanvasEnabled || undefined,
         },
       ]);
       setInput("");
@@ -1458,6 +1499,14 @@ export default function AgentOrchestrator() {
     // Image mode: explicit flag — backend skips intent classification and routes to image generation
     if (imageMode) {
       requestBody.image_mode = true;
+    }
+
+    // Canvas mode (MiBuddy-style): tells the backend the user wants a
+    // draft-style response. The outlook_agent also auto-enables this
+    // flag for compose_email / reply_email intents and returns
+    // `auto_canvas: true` — handled in onData below.
+    if (isCanvasEnabled) {
+      requestBody.canvas_enabled = true;
     }
 
     if (filePaths.length > 0) {
@@ -1571,11 +1620,37 @@ export default function AgentOrchestrator() {
             if (data?.reasoning_content) {
               accumulatedReasoning = data.reasoning_content;
             }
+            // MiBuddy canvas parity: backend auto-enabled canvas for the
+            // user (typically compose_email / reply_email from the
+            // Outlook agent). Flip the UI toggle on for future messages
+            // AND retroactively mark the current streaming message so
+            // its rendering switches to CanvasEditor.
+            if (data?.auto_canvas) {
+              setIsCanvasEnabled(true);
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === agentMsgId ? { ...m, canvasEnabled: true } : m,
+                ),
+              );
+            }
             // End event carries the final complete text — flush immediately.
             // BUT: if we received a HITL pause, do NOT overwrite the HITL
             // message with agent_text — the action buttons must stay visible.
             if (data?.agent_text && !hitlPauseReceived) {
               updateAgentMsg(data.agent_text, true);
+              // Re-bind the frontend placeholder's temporary UUID to the
+              // real DB id the backend just persisted, so that any later
+              // refetch-driven replacement can still match by id (needed
+              // for preserving canvas flag, reactions, etc.).
+              if (data?.message_id) {
+                setMessages((prev) =>
+                  prev.map((m) =>
+                    m.id === agentMsgId
+                      ? { ...m, id: String(data.message_id) }
+                      : m,
+                  ),
+                );
+              }
             } else if (!hitlPauseReceived && !receivedToken && latestAgentAddMessageText.trim()) {
               // Fallback for non-token flows where response text came only via
               // add_message and end has no agent_text payload.
@@ -2006,6 +2081,7 @@ export default function AgentOrchestrator() {
               <img src={notebookLMLogo} alt="" className="h-4 w-4 shrink-0 object-contain" />
               <span>{t("NotebookLM")}</span>
             </button>
+
           </div>
         </div>
 
@@ -2102,7 +2178,10 @@ export default function AgentOrchestrator() {
           <button
             onClick={() => {
               setShowPlusMenu(false);
-              setIsCanvasEnabled(!isCanvasEnabled);
+              const next = !isCanvasEnabled;
+              setIsCanvasEnabled(next);
+              // Canvas + image generation are mutually exclusive in MiBuddy.
+              if (next) setImageMode(false);
             }}
             className="flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
           >
@@ -2171,6 +2250,41 @@ export default function AgentOrchestrator() {
           </button>
             );
           })()}
+
+          {/* ---- Outlook Connector toggle (orchestrator) ---- */}
+          <button
+            onClick={async () => {
+              setShowPlusMenu(false);
+              if (isOutlookOrchConnected) {
+                await disconnectOutlookOrch();
+                setIsOutlookOrchConnected(false);
+              } else {
+                setShowOutlookOrch(true);
+              }
+            }}
+            className="flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
+          >
+            <div className="flex items-center gap-3">
+              <span
+                className="inline-flex h-4 w-4 items-center justify-center rounded-sm text-[10px] font-bold text-white"
+                style={{ background: "#0078D4" }}
+              >
+                O
+              </span>
+              <span>{t("Outlook Connector")}</span>
+            </div>
+            <div
+              className={`relative h-5 w-9 rounded-full transition-colors ${
+                isOutlookOrchConnected ? "bg-red-500" : "bg-muted-foreground/30"
+              }`}
+            >
+              <div
+                className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow-sm transition-transform ${
+                  isOutlookOrchConnected ? "translate-x-4" : "translate-x-0.5"
+                }`}
+              />
+            </div>
+          </button>
         </div>
       )}
 
@@ -2322,15 +2436,31 @@ export default function AgentOrchestrator() {
             )}
           </div>
 
-          {/* ---- Addon: AI Model selector (beside agent dropdown) ---- */}
+          {/* ---- Addon: AI Model selector (beside agent dropdown) ----
+               Disabled whenever an agent is selected; agents carry their
+               own models, so a top-level model pick is meaningless then.
+               When Model mode is active, users can still type @ in the
+               input to switch to an agent — `handleSend` already detects
+               that and swaps modes accordingly. */}
           <div ref={aiModelPickerRef} className="relative">
             <button
+              disabled={!noAgentMode}
               onClick={() => {
+                if (!noAgentMode) return;
                 setShowAiModelPicker(!showAiModelPicker);
                 setShowMoreModels(false);
               }}
+              title={
+                !noAgentMode
+                  ? t("An agent is selected — model picker disabled.")
+                  : undefined
+              }
               className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[15px] font-semibold hover:bg-accent ${
-                noAgentMode ? "text-foreground" : "text-muted-foreground"
+                !noAgentMode
+                  ? "cursor-not-allowed opacity-40 hover:bg-transparent"
+                  : noAgentMode
+                    ? "text-foreground"
+                    : "text-muted-foreground"
               }`}
             >
               {noAgentMode && selectedAiModel && aiModels.find((m) => m.id === selectedAiModel)?.icon ? (
@@ -2468,17 +2598,45 @@ export default function AgentOrchestrator() {
                 : (!!explicitHitlStatus || hasFollowupAgentReply);
               const resolvedLabel = explicitHitlStatus || (!msg.hitlIsDeployed && hasFollowupAgentReply ? "Completed" : "");
               const isRejectedResolution = resolvedLabel.toLowerCase().includes("reject");
+              // Figure out the right avatar for an AI response.
+              // - If the message's sender_name matches a known AI model
+              //   (e.g. "Gemini 2.5 Pro"), render that model's icon.
+              // - Else if it matches an agent, keep the existing colored
+              //   badge with the Sparkles glyph (agent branding).
+              // - Fallback: generic Sparkles badge.
+              const matchedModel =
+                !isUser && msg.agentName
+                  ? aiModels.find(
+                      (m) =>
+                        m.name === msg.agentName ||
+                        msg.agentName?.toLowerCase().includes(m.name.toLowerCase()),
+                    )
+                  : undefined;
               return (
                 <div key={msg.id} className="flex items-start gap-4 py-5">
                   {/* Avatar */}
                   <div
-                    className={`mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center ${
-                      isUser ? "rounded-full bg-muted" : "rounded-lg"
+                    className={`mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center overflow-hidden ${
+                      isUser
+                        ? "rounded-full bg-muted"
+                        : matchedModel
+                          ? "rounded-lg bg-muted"
+                          : "rounded-lg"
                     }`}
-                    style={!isUser ? { background: getAgentColor(msg.agentName) } : undefined}
+                    style={
+                      !isUser && !matchedModel
+                        ? { background: getAgentColor(msg.agentName) }
+                        : undefined
+                    }
                   >
                     {isUser ? (
                       <User size={16} className="text-muted-foreground" />
+                    ) : matchedModel?.icon ? (
+                      <img
+                        src={matchedModel.icon}
+                        alt=""
+                        className="h-5 w-5 object-contain"
+                      />
                     ) : (
                       <Sparkles size={16} color="white" />
                     )}
@@ -2543,12 +2701,29 @@ export default function AgentOrchestrator() {
                             isLoading={isSending && msg.id === streamingMsgId}
                           />
                         )}
-                        <MarkdownField
-                          chat={{}}
-                          isEmpty={!msg.content}
-                          chatMessage={msg.content}
-                          editedFlag={null}
-                        />
+                        {msg.canvasEnabled && msg.content ? (
+                          /* Canvas mode — render in editable card (MiBuddy parity) */
+                          <CanvasEditor
+                            messageId={msg.id}
+                            content={msg.content}
+                            sessionId={currentSessionId || undefined}
+                            showDraftButton={isOutlookOrchConnected}
+                            onContentChange={(updated) => {
+                              setMessages((prev) =>
+                                prev.map((m) =>
+                                  m.id === msg.id ? { ...m, content: updated } : m,
+                                ),
+                              );
+                            }}
+                          />
+                        ) : (
+                          <MarkdownField
+                            chat={{}}
+                            isEmpty={!msg.content}
+                            chatMessage={msg.content}
+                            editedFlag={null}
+                          />
+                        )}
                         {/* Action buttons row — hide when message contains a generated image */}
                         {msg.content && !isSending && !/!\[.*?\]\(.*?\)/.test(msg.content) && (
                           <div className="mt-1.5 flex items-center gap-1">
@@ -2699,8 +2874,22 @@ export default function AgentOrchestrator() {
           </div>
         </div>
 
-        {/* ================ INPUT AREA ================ */}
-        <div className="pointer-events-none absolute bottom-0 left-0 right-0 flex justify-center bg-gradient-to-t from-background from-40% to-transparent px-6 pb-6">
+        {/* ================ INPUT AREA ================
+             When the chat is empty, the input + heading sit centered in
+             the viewport (MiBuddy-style landing). After the first message
+             they drop to the bottom and the messages scroll above them. */}
+        <div
+          className={
+            messages.length === 0 && !isSending
+              ? "pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-6 px-6"
+              : "pointer-events-none absolute bottom-0 left-0 right-0 flex justify-center bg-gradient-to-t from-background from-40% to-transparent px-6 pb-6 transition-all"
+          }
+        >
+          {messages.length === 0 && !isSending && (
+            <h1 className="text-3xl font-semibold tracking-tight text-red-600 md:text-4xl">
+              {t("How can I assist you today?")}
+            </h1>
+          )}
           <div className="pointer-events-auto relative w-full max-w-3xl">
             {/* Mention dropdown */}
             {showMentions && (
@@ -2732,8 +2921,10 @@ export default function AgentOrchestrator() {
               </div>
             )}
 
-            {/* Text Input */}
-            <div className="overflow-hidden rounded-2xl border border-border bg-card shadow-sm">
+            {/* Text Input — pill-style. In light mode uses a very subtle
+                pink horizontal wash; in dark mode just the card color (the
+                MiBuddy-style gradient looks silvery/off in dark). */}
+            <div className="overflow-hidden rounded-[28px] border border-red-100 bg-gradient-to-r from-red-50/60 via-white to-red-50/60 shadow-md shadow-red-100/30 transition-all focus-within:border-red-300 focus-within:shadow-lg dark:border-border dark:from-card dark:via-card dark:to-card dark:shadow-none dark:focus-within:border-red-800/60">
               {/* File previews */}
               {uploadFiles.length > 0 && (
                 <div className="flex flex-wrap gap-2 px-4 pt-3">
@@ -2786,55 +2977,10 @@ export default function AgentOrchestrator() {
                   ))}
                 </div>
               )}
-              <textarea
-                ref={textareaRef}
-                value={input}
-                onChange={(e) => handleInputChange(e.target.value)}
-                onPaste={handlePaste}
-                disabled={isSending || !canInteract}
-                onKeyDown={(e) => {
-                  // Suggestion keyboard navigation
-                  if (showSuggestions && suggestions.length > 0) {
-                    if (e.key === "ArrowDown") {
-                      e.preventDefault();
-                      setSelectedSuggestionIdx((prev) => (prev + 1) % suggestions.length);
-                      return;
-                    }
-                    if (e.key === "ArrowUp") {
-                      e.preventDefault();
-                      setSelectedSuggestionIdx((prev) => (prev <= 0 ? suggestions.length - 1 : prev - 1));
-                      return;
-                    }
-                    if (e.key === "Enter" && !e.shiftKey && selectedSuggestionIdx >= 0) {
-                      e.preventDefault();
-                      handleSelectSuggestion(suggestions[selectedSuggestionIdx]);
-                      return;
-                    }
-                    if (e.key === "Escape") {
-                      setSuggestions([]);
-                      setShowSuggestions(false);
-                      return;
-                    }
-                  }
-                  if (e.key === "Enter" && !e.shiftKey) {
-                    e.preventDefault();
-                    setSuggestions([]); setShowSuggestions(false);
-                    handleSend();
-                  }
-                }}
-                placeholder={
-                  !canInteract
-                    ? t("You do not have permission to interact with agents.")
-                    : isSending
-                      ? t("Waiting for response...")
-                      : t("Message agents or type @ to mention...")
-                }
-                rows={1}
-                className={`w-full resize-none border-none bg-transparent px-5 py-4 pr-14 text-[15px] text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-0 ${(isSending || !canInteract) ? "cursor-not-allowed opacity-50" : ""}`}
-              />
-              {/* Canvas indicator pill */}
+              {/* Indicator pills (Canvas / Image / COT) — stacked above the
+                  single-line input row, same as before. */}
               {isCanvasEnabled && (
-                <div className="flex items-center px-4 pb-1">
+                <div className="flex items-center px-4 pt-2">
                   <div className="inline-flex items-center gap-1.5 rounded-full border border-red-200 bg-red-50 px-3 py-1 dark:border-red-800 dark:bg-red-950/30">
                     <Pencil size={12} className="text-red-500" />
                     <span className="text-xs font-semibold text-red-500">{t("Canvas")}</span>
@@ -2847,9 +2993,8 @@ export default function AgentOrchestrator() {
                   </div>
                 </div>
               )}
-              {/* Image mode indicator pill */}
               {imageMode && (
-                <div className="flex items-center px-4 pb-1">
+                <div className="flex items-center px-4 pt-2">
                   <div className="inline-flex items-center gap-1.5 rounded-full border border-red-200 bg-red-50 px-3 py-1 dark:border-red-800 dark:bg-red-950/30">
                     <Image size={12} className="text-red-500" />
                     <span className="text-xs font-semibold text-red-500">{t("Image")}</span>
@@ -2862,9 +3007,8 @@ export default function AgentOrchestrator() {
                   </div>
                 </div>
               )}
-              {/* COT reasoning pill */}
               {cotReasoning && (
-                <div className="flex items-center px-4 pb-1">
+                <div className="flex items-center px-4 pt-2">
                   <div className="inline-flex items-center gap-1.5 rounded-full border border-red-200 bg-red-50 px-3 py-1 dark:border-red-800 dark:bg-red-950/30">
                     <Lightbulb size={12} className="text-red-500" />
                     <span className="text-xs font-semibold text-red-500">{t("COT")}</span>
@@ -2877,36 +3021,83 @@ export default function AgentOrchestrator() {
                   </div>
                 </div>
               )}
-              <div className="flex items-center justify-between px-3 pb-3">
-                <div className="flex items-center gap-1">
-                  {/* ---- Addon: Plus menu button ---- */}
-                  <div data-plus-menu>
-                    <button
-                      onClick={(e) => {
-                        if (!showPlusMenu) {
-                          const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-                          setPlusMenuPos({ bottom: window.innerHeight - rect.top + 8, left: rect.left });
-                        }
-                        setShowPlusMenu(!showPlusMenu);
-                      }}
-                      disabled={isSending || !canInteract}
-                      className={`flex h-8 w-8 items-center justify-center rounded-lg text-muted-foreground transition-colors ${(isSending || !canInteract) ? "cursor-not-allowed opacity-50" : "hover:bg-accent hover:text-foreground"}`}
-                      title={t("More options")}
-                    >
-                      <Plus size={16} />
-                    </button>
-                  </div>
 
-                  {/* Existing: Upload image button */}
+              {/* Single-line input row: [+] [img] [textarea grows] [mic] [send] */}
+              <div className="flex items-center gap-1 px-3 py-2">
+                {/* ---- Addon: Plus menu button ---- */}
+                <div data-plus-menu className="shrink-0">
                   <button
-                    onClick={() => fileInputRef.current?.click()}
+                    onClick={(e) => {
+                      if (!showPlusMenu) {
+                        const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                        setPlusMenuPos({ bottom: window.innerHeight - rect.top + 8, left: rect.left });
+                      }
+                      setShowPlusMenu(!showPlusMenu);
+                    }}
                     disabled={isSending || !canInteract}
-                    className={`flex h-8 w-8 items-center justify-center rounded-lg text-muted-foreground transition-colors ${(isSending || !canInteract) ? "cursor-not-allowed opacity-50" : "hover:bg-accent hover:text-foreground"}`}
-                    title={t("Upload image")}
+                    className={`flex h-9 w-9 items-center justify-center rounded-full text-muted-foreground transition-colors ${(isSending || !canInteract) ? "cursor-not-allowed opacity-50" : "hover:bg-accent hover:text-foreground"}`}
+                    title={t("More options")}
                   >
-                    <ImagePlus size={16} />
+                    <Plus size={18} />
                   </button>
                 </div>
+
+                {/* Upload image button */}
+                <button
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={isSending || !canInteract}
+                  className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors ${(isSending || !canInteract) ? "cursor-not-allowed opacity-50" : "hover:bg-accent hover:text-foreground"}`}
+                  title={t("Upload image")}
+                >
+                  <ImagePlus size={18} />
+                </button>
+
+                <textarea
+                  ref={textareaRef}
+                  value={input}
+                  onChange={(e) => handleInputChange(e.target.value)}
+                  onPaste={handlePaste}
+                  disabled={isSending || !canInteract}
+                  onKeyDown={(e) => {
+                    if (showSuggestions && suggestions.length > 0) {
+                      if (e.key === "ArrowDown") {
+                        e.preventDefault();
+                        setSelectedSuggestionIdx((prev) => (prev + 1) % suggestions.length);
+                        return;
+                      }
+                      if (e.key === "ArrowUp") {
+                        e.preventDefault();
+                        setSelectedSuggestionIdx((prev) => (prev <= 0 ? suggestions.length - 1 : prev - 1));
+                        return;
+                      }
+                      if (e.key === "Enter" && !e.shiftKey && selectedSuggestionIdx >= 0) {
+                        e.preventDefault();
+                        handleSelectSuggestion(suggestions[selectedSuggestionIdx]);
+                        return;
+                      }
+                      if (e.key === "Escape") {
+                        setSuggestions([]);
+                        setShowSuggestions(false);
+                        return;
+                      }
+                    }
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      setSuggestions([]); setShowSuggestions(false);
+                      handleSend();
+                    }
+                  }}
+                  placeholder={
+                    !canInteract
+                      ? t("You do not have permission to interact with agents.")
+                      : isSending
+                        ? t("Waiting for response...")
+                        : t("Start typing with @ to chat with an agent")
+                  }
+                  rows={1}
+                  className={`min-w-0 flex-1 resize-none border-none bg-transparent px-2 py-1.5 text-[15px] leading-6 text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-0 ${(isSending || !canInteract) ? "cursor-not-allowed opacity-50" : ""}`}
+                />
+
                 <input
                   ref={fileInputRef}
                   type="file"
@@ -2915,35 +3106,35 @@ export default function AgentOrchestrator() {
                   className="hidden"
                   onChange={handleFileChange}
                 />
-                <div className="flex items-center gap-1">
-                  {/* ---- Addon: Microphone button (Speech-to-Text) ---- */}
-                  <button
-                    onClick={handleMicClick}
-                    disabled={isSending || !canInteract}
-                    className={`flex h-8 w-8 items-center justify-center rounded-lg transition-colors ${
-                      isListening
-                        ? "bg-red-500 text-white animate-pulse"
-                        : (isSending || !canInteract)
-                          ? "cursor-not-allowed text-muted-foreground opacity-50"
-                          : "text-muted-foreground hover:bg-accent hover:text-foreground"
-                    }`}
-                    title={isListening ? t("Stop listening") : t("Voice input")}
-                  >
-                    {isListening ? <AudioLines size={16} /> : <Mic size={16} />}
-                  </button>
-                  {/* Existing: Send button */}
-                  <button
-                    onClick={handleSend}
-                    disabled={(!input.trim() && !uploadFiles.some((f) => f.path)) || isSending || !canInteract}
-                    className={`flex h-8 w-8 items-center justify-center rounded-lg transition-colors ${
-                      (input.trim() || uploadFiles.some((f) => f.path)) && !isSending && canInteract
-                        ? "bg-foreground text-background hover:opacity-90"
-                        : "bg-muted text-muted-foreground"
-                    }`}
-                  >
-                    <Send size={16} className="-ml-px -mt-px" />
-                  </button>
-                </div>
+
+                {/* Mic */}
+                <button
+                  onClick={handleMicClick}
+                  disabled={isSending || !canInteract}
+                  className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full transition-colors ${
+                    isListening
+                      ? "bg-red-500 text-white animate-pulse"
+                      : (isSending || !canInteract)
+                        ? "cursor-not-allowed text-muted-foreground opacity-50"
+                        : "text-muted-foreground hover:bg-accent hover:text-foreground"
+                  }`}
+                  title={isListening ? t("Stop listening") : t("Voice input")}
+                >
+                  {isListening ? <AudioLines size={18} /> : <Mic size={18} />}
+                </button>
+
+                {/* Send */}
+                <button
+                  onClick={handleSend}
+                  disabled={(!input.trim() && !uploadFiles.some((f) => f.path)) || isSending || !canInteract}
+                  className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full transition-colors ${
+                    (input.trim() || uploadFiles.some((f) => f.path)) && !isSending && canInteract
+                      ? "bg-foreground text-background hover:opacity-90"
+                      : "bg-muted text-muted-foreground"
+                  }`}
+                >
+                  <Send size={16} className="-ml-px -mt-px" />
+                </button>
               </div>
             </div>
 
@@ -2960,18 +3151,15 @@ export default function AgentOrchestrator() {
         onDismiss={() => setSpPickerOpen(false)}
         onFilesSelected={handleSpFilesSelected}
       />
-      {/* ---- Addon: Outlook Connector ---- */}
-      <OutlookConnector
-        isOpen={outlookDialogOpen}
-        onDismiss={() => setOutlookDialogOpen(false)}
-        onConnected={() => {
-          setOutlookConnected(true);
-        }}
-        onDisconnected={() => {
-          setOutlookConnected(false);
-          refreshOutlookStatus();
-        }}
+
+      {/* ---- Outlook (orchestrator) connector ---- */}
+      <OutlookOrchConnector
+        isOpen={showOutlookOrch}
+        onDismiss={() => setShowOutlookOrch(false)}
+        onConnected={() => setIsOutlookOrchConnected(true)}
       />
+      {/* Old OutlookConnector modal removed — OutlookOrchConnector above
+          is the single Outlook integration going forward. */}
       {false && (
         <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/50">
           <div className="flex max-h-[80vh] w-full max-w-lg flex-col rounded-2xl border border-border bg-popover shadow-2xl">
