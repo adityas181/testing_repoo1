@@ -556,6 +556,15 @@ export default function AgentOrchestrator() {
   const [sidebarSearchQuery, setSidebarSearchQuery] = useState("");
   const [showSearchInput, setShowSearchInput] = useState(false);
   const [chatMenuOpenId, setChatMenuOpenId] = useState<string | null>(null);
+  // Context of the three-dot menu: "active" for chat history rows (Rename /
+  // Share / Archive / Delete) vs "archived" (Unarchive / Delete).
+  const [chatMenuContext, setChatMenuContext] = useState<"active" | "archived">("active");
+  // Per-session override of the user-chosen title. Optimistic update only —
+  // the authoritative value lives in `chat.session_title` from the sessions
+  // API. This ref/state is for instant UI feedback before the API returns.
+  const [titleOverrides, setTitleOverrides] = useState<Record<string, string | null>>({});
+  const [renamingSessionId, setRenamingSessionId] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState<string>("");
   const [chatMenuPos, setChatMenuPos] = useState<{ top: number; left: number }>({ top: 0, left: 0 });
   // Addon: AI Model selector state
   const [showAiModelPicker, setShowAiModelPicker] = useState(false);
@@ -1730,6 +1739,86 @@ export default function AgentOrchestrator() {
     setShowImageGallery(false);
   };
 
+  /* ──────────── Session rename / share (MiBuddy-parity helpers) ────────────
+   * Rename is persisted server-side in `orch_conversation.session_title`
+   * (migration 95791a21c989). The sessions-list API returns this value and
+   * the sidebar display picks it up. `titleOverrides` provides optimistic
+   * UI feedback before the API round-trip finishes.
+   * Share copies a link to the current session (same URL + ?session=<id>).
+   */
+  const startRenameSession = (sessionId: string) => {
+    const fromApi = (apiSessions || []).find((s) => s.session_id === sessionId);
+    const current =
+      titleOverrides[sessionId] ??
+      fromApi?.session_title ??
+      fromApi?.preview ??
+      "";
+    setRenameDraft(current);
+    setRenamingSessionId(sessionId);
+  };
+
+  const confirmRenameSession = async () => {
+    if (!renamingSessionId) return;
+    const title = renameDraft.trim() || null;
+    const sessionId = renamingSessionId;
+    // Optimistic UI update
+    setTitleOverrides((prev) => ({ ...prev, [sessionId]: title }));
+    setRenamingSessionId(null);
+    setRenameDraft("");
+    try {
+      await api.post(
+        `${getURL("ORCHESTRATOR")}/sessions/${sessionId}/title`,
+        { title },
+        { withCredentials: true },
+      );
+      // Refresh sessions so the authoritative title lands in apiSessions
+      refetchSessions();
+    } catch (err) {
+      console.error("Rename session failed:", err);
+      // Roll back the override so the old name reappears
+      setTitleOverrides((prev) => {
+        const { [sessionId]: _, ...rest } = prev;
+        return rest;
+      });
+      useAlertStore.getState().setErrorData({
+        title: t("Failed to rename chat"),
+        list: [String((err as Error)?.message || err)],
+      });
+    }
+  };
+
+  const cancelRenameSession = () => {
+    setRenamingSessionId(null);
+    setRenameDraft("");
+  };
+
+  const handleShareSession = async (sessionId: string) => {
+    const url = `${window.location.origin}${window.location.pathname}?session=${encodeURIComponent(sessionId)}`;
+    try {
+      await navigator.clipboard.writeText(url);
+      useAlertStore.getState().setSuccessData?.({
+        title: t("Share link copied to clipboard"),
+      });
+    } catch {
+      // Fallback: prompt the user so they can copy manually.
+      window.prompt(t("Copy this share link:"), url);
+    }
+  };
+
+  /** Title to render in the sidebar for a given chat row.
+   *  Priority: optimistic override > server-persisted title > preview >
+   *  agent name > "New conversation" fallback. */
+  const sessionDisplayName = (chat: { session_id: string; preview?: string | null; active_agent_name?: string | null; session_title?: string | null }) => {
+    const override = titleOverrides[chat.session_id];
+    return (
+      (override !== undefined ? override : null) ||
+      chat.session_title ||
+      chat.preview ||
+      chat.active_agent_name ||
+      t("New conversation")
+    );
+  };
+
   const handleDeleteSession = (sessionId: string) => {
     deleteSession(
       { session_id: sessionId },
@@ -1917,7 +2006,7 @@ export default function AgentOrchestrator() {
                                 {chat.active_agent_name ? ` - ${chat.active_agent_name}` : ""}
                               </div>
                               <div className="mt-0.5 truncate text-xs text-muted-foreground">
-                                {chat.preview || t("New conversation")}
+                                {sessionDisplayName(chat)}
                               </div>
                             </div>
                           </button>
@@ -1963,33 +2052,66 @@ export default function AgentOrchestrator() {
                       key={chat.session_id}
                       className="group relative flex items-center"
                     >
-                      <button
-                        onClick={() => handleSelectSession(chat.session_id)}
-                        className={`flex min-w-0 flex-1 items-center gap-2 truncate rounded-lg px-3 py-2 pr-8 text-left text-sm text-foreground hover:bg-accent ${
-                          currentSessionId === chat.session_id ? "bg-accent" : ""
-                        }`}
-                      >
-                        <MessageSquare size={14} className="shrink-0 opacity-50" />
-                        <span className="truncate">{chat.preview || t("New conversation")}</span>
-                      </button>
+                      {renamingSessionId === chat.session_id ? (
+                        /* Inline rename input (MiBuddy-parity) */
+                        <div className="flex min-w-0 flex-1 items-center gap-1 rounded-lg bg-accent px-2 py-1">
+                          <input
+                            autoFocus
+                            value={renameDraft}
+                            onChange={(e) => setRenameDraft(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") confirmRenameSession();
+                              if (e.key === "Escape") cancelRenameSession();
+                            }}
+                            className="min-w-0 flex-1 rounded border border-border bg-background px-2 py-1 text-sm text-foreground outline-none"
+                          />
+                          <button
+                            onClick={(e) => { e.stopPropagation(); confirmRenameSession(); }}
+                            className="rounded p-1 text-green-600 hover:bg-background"
+                            title={t("Save")}
+                          >
+                            <Check size={14} />
+                          </button>
+                          <button
+                            onClick={(e) => { e.stopPropagation(); cancelRenameSession(); }}
+                            className="rounded p-1 text-muted-foreground hover:bg-background"
+                            title={t("Cancel")}
+                          >
+                            <X size={14} />
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          onClick={() => handleSelectSession(chat.session_id)}
+                          className={`flex min-w-0 flex-1 items-center gap-2 truncate rounded-lg px-3 py-2 pr-8 text-left text-sm text-foreground hover:bg-accent ${
+                            currentSessionId === chat.session_id ? "bg-accent" : ""
+                          }`}
+                        >
+                          <MessageSquare size={14} className="shrink-0 opacity-50" />
+                          <span className="truncate">{sessionDisplayName(chat)}</span>
+                        </button>
+                      )}
                       {/* Three-dot menu button — visible on hover */}
-                      <button
-                        data-chat-menu
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          if (chatMenuOpenId === chat.session_id) {
-                            setChatMenuOpenId(null);
-                          } else {
-                            const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-                            setChatMenuPos({ top: rect.bottom + 4, left: rect.right - 140 });
-                            setChatMenuOpenId(chat.session_id);
-                          }
-                        }}
-                        className="invisible absolute right-1 shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground group-hover:visible"
-                        title={t("Options")}
-                      >
-                        <MoreVertical size={14} />
-                      </button>
+                      {renamingSessionId !== chat.session_id && (
+                        <button
+                          data-chat-menu
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (chatMenuOpenId === chat.session_id) {
+                              setChatMenuOpenId(null);
+                            } else {
+                              const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                              setChatMenuPos({ top: rect.bottom + 4, left: rect.right - 160 });
+                              setChatMenuContext("active");
+                              setChatMenuOpenId(chat.session_id);
+                            }
+                          }}
+                          className="invisible absolute right-1 shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground group-hover:visible"
+                          title={t("Options")}
+                        >
+                          <MoreVertical size={14} />
+                        </button>
+                      )}
                     </div>
                   ))}
                 </div>
@@ -2030,17 +2152,26 @@ export default function AgentOrchestrator() {
                           }`}
                         >
                           <Archive size={14} className="shrink-0 opacity-50" />
-                          <span className="truncate">{chat.preview || t("New conversation")}</span>
+                          <span className="truncate">{sessionDisplayName(chat)}</span>
                         </button>
+                        {/* Three-dot menu — Unarchive + Delete */}
                         <button
+                          data-chat-menu
                           onClick={(e) => {
                             e.stopPropagation();
-                            handleArchiveSession(chat.session_id, false);
+                            if (chatMenuOpenId === chat.session_id) {
+                              setChatMenuOpenId(null);
+                            } else {
+                              const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                              setChatMenuPos({ top: rect.bottom + 4, left: rect.right - 160 });
+                              setChatMenuContext("archived");
+                              setChatMenuOpenId(chat.session_id);
+                            }
                           }}
                           className="invisible absolute right-1 shrink-0 rounded p-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground group-hover:visible"
-                          title={t("Unarchive")}
+                          title={t("Options")}
                         >
-                          <ArrowLeft size={14} />
+                          <MoreVertical size={14} />
                         </button>
                       </div>
                     ))}
@@ -2288,13 +2419,68 @@ export default function AgentOrchestrator() {
         </div>
       )}
 
-      {/* Three-dot chat menu dropdown — rendered fixed to escape scroll container */}
+      {/* Three-dot chat menu dropdown — rendered fixed to escape scroll
+          container. Context-aware:
+            - "active"   → Rename, Share, Archive, Delete (MiBuddy parity)
+            - "archived" → Unarchive, Delete                               */}
       {chatMenuOpenId && (
         <div
           data-chat-menu
-          className="fixed z-[100] min-w-[140px] rounded-lg border border-border bg-popover p-1 shadow-lg"
+          className="fixed z-[100] min-w-[160px] rounded-lg border border-border bg-popover p-1 shadow-lg"
           style={{ top: chatMenuPos.top, left: chatMenuPos.left }}
         >
+          {chatMenuContext === "active" && (
+            <>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  const sessionId = chatMenuOpenId;
+                  setChatMenuOpenId(null);
+                  startRenameSession(sessionId);
+                }}
+                className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-sm text-foreground hover:bg-accent"
+              >
+                <Pencil size={14} />
+                <span>{t("Rename")}</span>
+              </button>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  const sessionId = chatMenuOpenId;
+                  setChatMenuOpenId(null);
+                  handleShareSession(sessionId);
+                }}
+                className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-sm text-foreground hover:bg-accent"
+              >
+                <Upload size={14} />
+                <span>{t("Share")}</span>
+              </button>
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setChatMenuOpenId(null);
+                  handleArchiveSession(chatMenuOpenId!, true);
+                }}
+                className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-sm text-foreground hover:bg-accent"
+              >
+                <Archive size={14} />
+                <span>{t("Archive")}</span>
+              </button>
+            </>
+          )}
+          {chatMenuContext === "archived" && (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                setChatMenuOpenId(null);
+                handleArchiveSession(chatMenuOpenId!, false);
+              }}
+              className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-sm text-foreground hover:bg-accent"
+            >
+              <ArrowLeft size={14} />
+              <span>{t("Unarchive")}</span>
+            </button>
+          )}
           <button
             onClick={(e) => {
               e.stopPropagation();
@@ -2306,17 +2492,6 @@ export default function AgentOrchestrator() {
           >
             <Trash2 size={14} />
             <span>{t("Delete")}</span>
-          </button>
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              setChatMenuOpenId(null);
-              handleArchiveSession(chatMenuOpenId!, true);
-            }}
-            className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-sm text-foreground hover:bg-accent"
-          >
-            <Archive size={14} />
-            <span>{t("Archive")}</span>
           </button>
         </div>
       )}
