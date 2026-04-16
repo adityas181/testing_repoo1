@@ -793,6 +793,13 @@ export default function AgentOrchestrator() {
         return;
       }
       const mapped = mapApiMessages(apiSessionMessages);
+      // DEBUG: log what's arriving from API vs what we have locally
+      console.warn("[Refetch] API returned", mapped.length, "messages. Local had:", mapped.length);
+      mapped.forEach((m) => {
+        if (m.sender === "agent") {
+          console.warn("[Refetch] API msg", m.id.slice(0, 8), "contentBlocks:", m.contentBlocks?.length || 0, "reasoning:", m.reasoningContent?.length || 0);
+        }
+      });
       // Preserve canvas state on refetch — the mapper reads it from
       // `properties.canvas_enabled` in the DB, but if a message was
       // already flagged in-memory we keep that flag even if the DB
@@ -803,6 +810,9 @@ export default function AgentOrchestrator() {
         prev.forEach((m) => {
           if (m.canvasEnabled) prevCanvasIds[m.id] = true;
           prevById.set(m.id, m);
+          if (m.sender === "agent") {
+            console.warn("[Refetch] Local msg", m.id.slice(0, 8), "contentBlocks:", m.contentBlocks?.length || 0, "reasoning:", m.reasoningContent?.length || 0);
+          }
         });
         return mapped.map((m) => {
           const local = prevById.get(m.id);
@@ -817,6 +827,9 @@ export default function AgentOrchestrator() {
               blocksState: merged.contentBlocks ? merged.blocksState : (local.blocksState ?? merged.blocksState),
               reasoningContent: merged.reasoningContent ?? local.reasoningContent,
             };
+            if (m.sender === "agent" && (local.contentBlocks?.length || local.reasoningContent)) {
+              console.warn("[Refetch] MERGED msg", m.id.slice(0, 8), "final contentBlocks:", merged.contentBlocks?.length || 0, "final reasoning:", merged.reasoningContent?.length || 0);
+            }
           }
           return merged;
         });
