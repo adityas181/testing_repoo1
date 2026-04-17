@@ -30,13 +30,13 @@ class RedisBuildEventStore:
         self.prefix = f"agentcore:{namespace}"
 
     def _events_key(self, job_id: str) -> str:
-        return f"{self.prefix}:{job_id}:events"
+        return f"{self.prefix}:{{{job_id}}}:events"
 
     def _meta_key(self, job_id: str) -> str:
-        return f"{self.prefix}:{job_id}:meta"
+        return f"{self.prefix}:{{{job_id}}}:meta"
 
     def _poll_cursor_key(self, job_id: str) -> str:
-        return f"{self.prefix}:{job_id}:poll_cursor"
+        return f"{self.prefix}:{{{job_id}}}:poll_cursor"
 
     async def _touch(self, job_id: str) -> None:
         await self.redis.expire(self._events_key(job_id), self.ttl_seconds)
@@ -114,6 +114,8 @@ class RedisBuildEventStore:
         return list(events or [])
 
     async def job_exists(self, job_id: str) -> bool:
+        # Both keys now share the same hash slot via {job_id} tag,
+        # so multi-key EXISTS works in Redis Cluster mode.
         return bool(await self.redis.exists(self._meta_key(job_id), self._events_key(job_id)))
 
 
