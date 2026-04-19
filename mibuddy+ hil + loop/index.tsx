@@ -3247,9 +3247,10 @@ export default function AgentOrchestrator() {
                               </div>
                             )}
                             {/* Prompt action buttons — Copy and Edit
-                                Shown ONLY in model mode (No Agent), not when chatting with an agent. */}
+                                Shown ONLY in model mode (No Agent), not when chatting with an agent.
+                                Always visible (no hover-only) — matches MiBuddy UX. */}
                             {msg.content && !isSending && noAgentMode && (
-                              <div className="mt-1.5 flex items-center gap-1 opacity-0 transition-opacity group-hover/usermsg:opacity-100">
+                              <div className="mt-1.5 flex items-center gap-1">
                                 <button
                                   onClick={() => handleCopyMessage(msg.content, msg.id)}
                                   className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
@@ -3720,9 +3721,9 @@ export default function AgentOrchestrator() {
                   {isListening ? <AudioLines size={18} /> : <Mic size={18} />}
                 </button>
 
-                {/* Send */}
+                {/* Send — wrap in arrow fn so React's MouseEvent isn't passed as the override text */}
                 <button
-                  onClick={handleSend}
+                  onClick={() => handleSend()}
                   disabled={(!input.trim() && !uploadFiles.some((f) => f.path)) || isSending || !canInteract || isSharedReadOnly || hasPendingHitl}
                   className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full transition-colors ${
                     (input.trim() || uploadFiles.some((f) => f.path)) && !isSending && canInteract && !isSharedReadOnly && !hasPendingHitl
