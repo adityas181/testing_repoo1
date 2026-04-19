@@ -1852,23 +1852,40 @@ export default function AgentOrchestrator() {
 
           // MiBuddy-style instant model switch: backend emits a "routing" event
           // IMMEDIATELY after deciding the destination (mode/model), before the
-          // actual response is generated. Update the dropdown right away so the
-          // user sees the switch without waiting for the full response.
+          // actual response is generated. Update the dropdown AND the currently-
+          // streaming message's agent name right away so the user sees the switch
+          // without waiting for the full response.
           if (eventType === "routing") {
             console.warn("[Orch][routing event]", data);
+            let routedDisplayName: string | null = null;
             if (noAgentMode && data?.routed_model_id) {
               const routedId = String(data.routed_model_id);
-              if (routedId !== selectedAiModel) {
-                const match = aiModels.find((m) => m.id === routedId);
-                if (match) setSelectedAiModel(routedId);
+              const match = aiModels.find((m) => m.id === routedId);
+              if (match) {
+                routedDisplayName = match.name;
+                if (routedId !== selectedAiModel) setSelectedAiModel(routedId);
               }
-            } else if (noAgentMode && data?.routed_model_name) {
-              const byName = aiModels.find(
-                (m) => m.name.toLowerCase() === String(data.routed_model_name).toLowerCase(),
-              );
-              if (byName && byName.id !== selectedAiModel) setSelectedAiModel(byName.id);
             }
-            // Don't early-return — keep the stream consumer alive for later events
+            if (!routedDisplayName && data?.routed_model_name) {
+              const nameStr = String(data.routed_model_name);
+              routedDisplayName = nameStr;
+              if (noAgentMode) {
+                const byName = aiModels.find(
+                  (m) => m.name.toLowerCase() === nameStr.toLowerCase(),
+                );
+                if (byName && byName.id !== selectedAiModel) setSelectedAiModel(byName.id);
+              }
+            }
+            // Update the "Thinking..." placeholder message's agentName so the
+            // sender label flips to the routed model immediately.
+            if (routedDisplayName) {
+              setStreamingAgentName(routedDisplayName);
+              setMessages((prev) =>
+                prev.map((m) =>
+                  m.id === agentMsgId ? { ...m, agentName: routedDisplayName || m.agentName } : m,
+                ),
+              );
+            }
             return true;
           }
 
