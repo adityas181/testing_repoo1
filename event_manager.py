@@ -228,6 +228,10 @@ def create_default_event_manager(queue):
     manager.register_event("on_end_vertex", "end_vertex")
     manager.register_event("on_build_start", "build_start")
     manager.register_event("on_build_end", "build_end")
+    # MiBuddy-style: fires immediately after the backend decides where to route
+    # the request. Carries {routed_model_id, routed_model_name} so the frontend
+    # can update the model dropdown instantly, before the response is generated.
+    manager.register_event("on_routing", "routing")
     return manager
 
 
@@ -236,4 +240,5 @@ def create_stream_tokens_event_manager(queue):
     manager.register_event("on_message", "add_message")
     manager.register_event("on_token", "token")
     manager.register_event("on_end", "end")
+    manager.register_event("on_error", "error")
     return manager

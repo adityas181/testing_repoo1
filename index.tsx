@@ -288,9 +288,11 @@ function mapApiMessages(apiMessages: OrchMessageResponse[]): Message[] {
       hitl: isHitl,
       hitlActions: isHitl ? parsedActions : undefined,
       hitlThreadId: isHitl ? (props.thread_id ?? m.session_id ?? "") : undefined,
-      // Orchestrator chat runs deployed agents; default true when missing.
+      // Default false when missing: backend stores playground runs as
+      // is_deployed_run=false with no assignee, and showing "Pending dept admin"
+      // for those runs contradicts the HITL page (which shows "Unassigned").
       hitlIsDeployed: isHitl
-        ? (props.is_deployed_run !== undefined ? !!props.is_deployed_run : true)
+        ? (props.is_deployed_run !== undefined ? !!props.is_deployed_run : false)
         : undefined,
       reasoningContent: (m as any).reasoning_content || undefined,
     };
@@ -399,7 +401,7 @@ function ImageGalleryView({
 
   // Fetch AI-generated images from MiBuddy dedicated endpoint
   useEffect(() => {
-    const tokenMatch = document.cookie.match(/(?:^|;\s*)access_token_lf=([^;]*)/);
+    const tokenMatch = document.cookie.match(/(?:^|;\s*)access_token_ag=([^;]*)/);
     const headers: Record<string, string> = {};
     if (tokenMatch?.[1]) headers["Authorization"] = `Bearer ${decodeURIComponent(tokenMatch[1])}`;
 
@@ -421,18 +423,38 @@ function ImageGalleryView({
 
   const handleDownload = async (src: string, name: string) => {
     try {
-      const res = await fetch(src);
+      // Authenticated endpoints (/api/orchestrator/images/...) require JWT header.
+      // Plain fetch(src) fails silently → falls back to window.open which just
+      // opens/expands the image instead of downloading it.
+      const headers: Record<string, string> = {};
+      const tokenMatch = document.cookie.match(/(?:^|;\s*)access_token_lf=([^;]*)/);
+      if (tokenMatch?.[1]) {
+        headers["Authorization"] = `Bearer ${decodeURIComponent(tokenMatch[1])}`;
+      }
+      const res = await fetch(src, { headers, credentials: "include" });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
       a.download = name || `image-${Date.now()}.png`;
+      a.style.display = "none";
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-    } catch {
-      window.open(src, "_blank");
+      // Delay revoke slightly to ensure the download kicks off on all browsers
+      setTimeout(() => URL.revokeObjectURL(url), 500);
+    } catch (err) {
+      console.error("[handleDownload] Failed:", err);
+      // Last-resort fallback: trigger download via anchor with download attr
+      // (works for same-origin URLs). Avoid window.open which just expands the image.
+      const a = document.createElement("a");
+      a.href = src;
+      a.download = name || `image-${Date.now()}.png`;
+      a.style.display = "none";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
     }
   };
 
@@ -588,6 +610,12 @@ export default function AgentOrchestrator() {
   // Addon: Per-message export menu (msg.id) and copy feedback
   const [exportMenuOpenId, setExportMenuOpenId] = useState<string | null>(null);
   const [copiedMsgId, setCopiedMsgId] = useState<string | null>(null);
+  // Inline prompt editing (user messages)
+  const [editingMsgId, setEditingMsgId] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState<string>("");
+  // Ref holder so handleSaveEdit can call handleSend without creating a circular
+  // useCallback dependency chain. Accepts an optional override text for edit-and-send.
+  const handleSendRef = useRef<((overrideText?: string) => void) | null>(null);
   const [canvasEditingId, setCanvasEditingId] = useState<string | null>(null);
   const [canvasEditTexts, setCanvasEditTexts] = useState<Record<string, string>>({});
   // Addon: Autocomplete suggestions
@@ -595,6 +623,10 @@ export default function AgentOrchestrator() {
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [selectedSuggestionIdx, setSelectedSuggestionIdx] = useState(-1);
   const suggestionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // AbortController so we can cancel any in-flight suggestion fetches when the
+  // user clicks Send. Without this, a debounced fetch can return AFTER the
+  // message is submitted and re-show suggestions under the response.
+  const suggestionAbortRef = useRef<AbortController | null>(null);
   // Addon: Speech-to-Text (mic)
   const [isListening, setIsListening] = useState(false);
   const recognitionRef = useRef<any>(null);
@@ -621,9 +653,9 @@ export default function AgentOrchestrator() {
     "py", "js", "ts", "java", "cpp", "c", "cs", "go",       // Code
     "json", "html", "css", "php", "rb", "sh", "tex",        // More code/markup
   ];
-  const ALLOWED_EXTENSIONS = noAgentMode
-    ? [...IMAGE_EXTENSIONS_LIST, ...DOC_EXTENSIONS_LIST]     // Model mode: all file types
-    : IMAGE_EXTENSIONS_LIST;                                  // Agent mode: images only
+  // Both modes accept all file types (images + documents). Agent mode previously
+  // restricted to images only — removed per UX feedback.
+  const ALLOWED_EXTENSIONS = [...IMAGE_EXTENSIONS_LIST, ...DOC_EXTENSIONS_LIST];
 
   const uploadFile = (file: File) => {
     const ext = file.name.split(".").pop()?.toLowerCase();
@@ -636,7 +668,7 @@ export default function AgentOrchestrator() {
       // Model mode: upload to MiBuddy dedicated container
       const formData = new FormData();
       formData.append("file", file);
-      const tokenMatch = document.cookie.match(/(?:^|;\s*)access_token_lf=([^;]*)/);
+      const tokenMatch = document.cookie.match(/(?:^|;\s*)access_token_ag=([^;]*)/);
       const headers: Record<string, string> = {};
       if (tokenMatch?.[1]) headers["Authorization"] = `Bearer ${decodeURIComponent(tokenMatch[1])}`;
 
@@ -709,6 +741,12 @@ export default function AgentOrchestrator() {
   const handlePaste = (e: React.ClipboardEvent) => {
     const items = e.clipboardData?.items;
     if (!items) return;
+    // Enforce the 5-file limit on paste too (not just the file picker)
+    if (uploadFiles.length >= MAX_FILES) {
+      alert(`Maximum ${MAX_FILES} files allowed.`);
+      e.preventDefault();
+      return;
+    }
     for (let i = 0; i < items.length; i++) {
       if (items[i].type.startsWith("image/")) {
         const blob = items[i].getAsFile();
@@ -754,6 +792,26 @@ export default function AgentOrchestrator() {
   const { data: apiSessions, refetch: refetchSessions } = useGetOrchSessions();
   const { mutate: deleteSession } = useDeleteOrchSession();
 
+  /* MiBuddy-parity share-link deep-link: when the page mounts with
+   * `?session=<id>` in the URL (typical when a user pastes a shared
+   * link), remember the session id. ProtectedRoute has already bounced
+   * an unauthenticated viewer through login before we get here. */
+  const [pendingSharedId, setPendingSharedId] = useState<string | null>(null);
+  const [isSharedReadOnly, setIsSharedReadOnly] = useState(false);
+  const sharedLinkCapturedRef = useRef(false);
+  useEffect(() => {
+    if (sharedLinkCapturedRef.current) return;
+    sharedLinkCapturedRef.current = true;
+    const params = new URLSearchParams(window.location.search);
+    const sid = params.get("session");
+    if (!sid) return;
+    setPendingSharedId(sid);
+    setShowImageGallery(false);
+    // Strip the query param so a refresh doesn't re-trigger.
+    const clean = window.location.pathname + window.location.hash;
+    window.history.replaceState({}, "", clean);
+  }, []);
+
   const agents: Agent[] = useMemo(
     () => (apiAgents ? mapApiAgents(apiAgents) : []),
     [apiAgents],
@@ -763,6 +821,31 @@ export default function AgentOrchestrator() {
     [agents, selectedModelId],
   );
   const canInteract = permissions?.includes("interact_agents") ?? false;
+
+  // Block typing/sending while an agent is waiting for an HITL approve/reject.
+  // Why: once the agent pauses for human review, new user input must not be
+  // sent until the pending decision is resolved — otherwise the resume call
+  // loses context and the UI desyncs.
+  const hasPendingHitl = useMemo(() => {
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+      if (!msg.hitl) continue;
+      const explicitHitlStatus = hitlDoneMap[msg.id];
+      const hasFollowupAgentReply = messages
+        .slice(i + 1)
+        .some(
+          (nextMsg) =>
+            nextMsg.sender === "agent" &&
+            !nextMsg.hitl &&
+            (!!nextMsg.content?.trim() || !!nextMsg.contentBlocks?.length),
+        );
+      const resolved = msg.hitlIsDeployed
+        ? !!explicitHitlStatus
+        : (!!explicitHitlStatus || hasFollowupAgentReply);
+      if (!resolved) return true;
+    }
+    return false;
+  }, [messages, hitlDoneMap]);
 
   // The effective session ID for fetching messages: activeSessionId is set
   // when the user clicks a session in the sidebar.  When null (e.g. after
@@ -853,6 +936,62 @@ export default function AgentOrchestrator() {
     }
   }, [apiSessionMessages, effectiveSessionId, apiSessions, agents]);
 
+  /* Resolve a pending share-link session once the user's own session
+   * list has loaded. If the shared session belongs to the viewer, take
+   * the normal selection path (the useGetOrchMessages hook will then
+   * fetch it). Otherwise treat the UUID as a MiBuddy-style share token
+   * and pull messages from the `/sessions/{id}/shared-messages`
+   * endpoint (authenticated, no owner filter), rendering them in
+   * read-only mode. */
+  useEffect(() => {
+    if (!pendingSharedId) return;
+    if (apiSessions === undefined) return; // sessions still loading
+    const owned = apiSessions.some((s) => s.session_id === pendingSharedId);
+    if (owned) {
+      setActiveSessionId(pendingSharedId);
+      setIsSharedReadOnly(false);
+      setPendingSharedId(null);
+      return;
+    }
+    let cancelled = false;
+    const tokenMatch = document.cookie.match(/(?:^|;\s*)access_token_ag=([^;]*)/);
+    const headers: Record<string, string> = {};
+    if (tokenMatch?.[1]) {
+      headers["Authorization"] = `Bearer ${decodeURIComponent(tokenMatch[1])}`;
+    }
+    const url = `${getURL("ORCHESTRATOR")}/sessions/${encodeURIComponent(pendingSharedId)}/shared-messages`;
+    fetch(url, { headers, credentials: "include" })
+      .then(async (res) => {
+        if (!res.ok) {
+          const body = await res.text().catch(() => "");
+          throw new Error(res.status === 404
+            ? "This shared chat does not exist or has been deleted."
+            : `Failed to load shared chat (${res.status}) ${body}`);
+        }
+        return res.json();
+      })
+      .then((payload: { is_owner: boolean; messages: OrchMessageResponse[] }) => {
+        if (cancelled) return;
+        const mapped = mapApiMessages(payload.messages || []);
+        setMessages(mapped);
+        setCurrentSessionId(pendingSharedId);
+        setActiveSessionId(null); // don't trigger user-scoped fetch
+        setIsSharedReadOnly(!payload.is_owner);
+        setPendingSharedId(null);
+      })
+      .catch((err: Error) => {
+        if (cancelled) return;
+        useAlertStore.getState().setErrorData?.({
+          title: "Could not load shared chat",
+          list: [err.message],
+        });
+        setPendingSharedId(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [pendingSharedId, apiSessions]);
+
   // Fetch available models from backend
   useEffect(() => {
     let cancelled = false;
@@ -860,7 +999,7 @@ export default function AgentOrchestrator() {
     const modelsUrl = `${getURL("ORCHESTRATOR")}/models`;
     const headers: Record<string, string> = {};
     // Extract JWT from cookie (same cookie name used by axios interceptor)
-    const tokenMatch = document.cookie.match(/(?:^|;\s*)access_token_lf=([^;]*)/);
+    const tokenMatch = document.cookie.match(/(?:^|;\s*)access_token_ag=([^;]*)/);
     if (tokenMatch?.[1]) {
       headers["Authorization"] = `Bearer ${decodeURIComponent(tokenMatch[1])}`;
     }
@@ -898,8 +1037,20 @@ export default function AgentOrchestrator() {
     let isMounted = true;
     const syncStatuses = async () => {
       try {
-        const res = await api.get(`${getURL("HITL")}/pending`, {
-          params: { status: "all" },
+        // Collect unique thread_ids for visible HITL messages.
+        const threadIds = Array.from(
+          new Set(
+            hitlMsgs
+              .map((m) => m.hitlThreadId)
+              .filter((t): t is string => !!t),
+          ),
+        );
+        if (threadIds.length === 0) return;
+
+        // Use the creator-or-assignee endpoint so the run's creator (not just
+        // the dept admin assignee) also gets resolved status for the banner.
+        const res = await api.get(`${getURL("HITL")}/thread-status`, {
+          params: { thread_ids: threadIds.join(",") },
         });
         const rows: Array<{ thread_id?: string; status?: string; requested_at?: string }> = Array.isArray(res.data)
           ? res.data
@@ -974,6 +1125,24 @@ export default function AgentOrchestrator() {
       setCotReasoning(false);
     }
   }, [selectedAiModel, noAgentMode, aiModels, cotReasoning]);
+
+  // Auto-enable image mode when user selects an image-generation model (Nano Banana,
+  // DALL-E, etc.), and auto-disable when switching to any other model.
+  useEffect(() => {
+    if (!noAgentMode || !selectedAiModel) {
+      if (imageMode) setImageMode(false);
+      return;
+    }
+    const current = aiModels.find((m) => m.id === selectedAiModel);
+    const modelName = (current?.name || "").toLowerCase();
+    const isImageModel = /nano[\s_-]?banana|dall[\s_-]?e|flash[\s_-]?image|image[\s_-]?gen/.test(modelName);
+    if (isImageModel && !imageMode) {
+      setImageMode(true);
+      setIsCanvasEnabled(false);
+    } else if (!isImageModel && imageMode) {
+      setImageMode(false);
+    }
+  }, [selectedAiModel, noAgentMode, aiModels, imageMode]);
 
   // Update filteredAgents when agents load
   useEffect(() => {
@@ -1142,6 +1311,9 @@ export default function AgentOrchestrator() {
 
     // Autocomplete suggestions — only in model mode, debounced fetch
     if (suggestionTimerRef.current) clearTimeout(suggestionTimerRef.current);
+    // Cancel any in-flight suggestion fetch from a previous keystroke so its
+    // delayed response can't re-show suggestions after the user has already sent.
+    if (suggestionAbortRef.current) suggestionAbortRef.current.abort();
     setSelectedSuggestionIdx(-1);
     if (!noAgentMode || value.trim().length < 2) {
       setSuggestions([]);
@@ -1151,16 +1323,25 @@ export default function AgentOrchestrator() {
     suggestionTimerRef.current = setTimeout(() => {
       const suggestUrl = `${getURL("ORCHESTRATOR")}/suggestions?q=${encodeURIComponent(value.trim())}`;
       const headers: Record<string, string> = {};
-      const tokenMatch = document.cookie.match(/(?:^|;\s*)access_token_lf=([^;]*)/);
+      const tokenMatch = document.cookie.match(/(?:^|;\s*)access_token_ag=([^;]*)/);
       if (tokenMatch?.[1]) headers["Authorization"] = `Bearer ${decodeURIComponent(tokenMatch[1])}`;
-      fetch(suggestUrl, { headers, credentials: "include" })
+      const controller = new AbortController();
+      suggestionAbortRef.current = controller;
+      fetch(suggestUrl, { headers, credentials: "include", signal: controller.signal })
         .then((r) => r.ok ? r.json() : null)
         .then((data) => {
+          // Guard against a stale response (aborted or a newer fetch started)
+          if (controller.signal.aborted) return;
           const items: string[] = data?.suggestions || [];
           setSuggestions(items);
           setShowSuggestions(items.length > 0);
         })
-        .catch(() => { setSuggestions([]); setShowSuggestions(false); });
+        .catch((err) => {
+          // Silent on abort; clear on other errors
+          if (err?.name === "AbortError") return;
+          setSuggestions([]);
+          setShowSuggestions(false);
+        });
     }, 400);
   };
 
@@ -1328,11 +1509,132 @@ export default function AgentOrchestrator() {
     setTimeout(() => setCopiedMsgId((id) => (id === msgId ? null : id)), 1500);
   }, []);
 
+  // Start inline editing a user message
+  const handleStartEdit = useCallback((msgId: string, currentText: string) => {
+    setEditingMsgId(msgId);
+    setEditDraft(currentText);
+  }, []);
+
+  const handleCancelEdit = useCallback(() => {
+    setEditingMsgId(null);
+    setEditDraft("");
+  }, []);
+
+  // Save the edited prompt — MiBuddy-style in-place UPSERT.
+  // Calls PUT /messages/{id}/edit which updates the user msg + next agent msg
+  // in the DB (same IDs, new content). Frontend hides messages after the edit
+  // pair in the UI (MiBuddy behavior).
+  const handleSaveEdit = useCallback(async () => {
+    const text = editDraft.trim();
+    const msgIdBeingEdited = editingMsgId;
+    setEditingMsgId(null);
+    setEditDraft("");
+    if (!text || !msgIdBeingEdited) return;
+
+    // 1. Optimistic update: set user msg text to edited value, mark agent msg
+    // as "thinking" (empty content) and truncate anything after the pair.
+    setMessages((prev) => {
+      const userIdx = prev.findIndex((m) => m.id === msgIdBeingEdited);
+      if (userIdx === -1) return prev;
+      // Find the next agent message AFTER this user msg
+      let agentIdx = -1;
+      for (let i = userIdx + 1; i < prev.length; i++) {
+        if (prev[i].sender === "agent") {
+          agentIdx = i;
+          break;
+        }
+      }
+      const truncateAt = agentIdx === -1 ? userIdx + 1 : agentIdx + 1;
+      const updated = [...prev.slice(0, truncateAt)];
+      // Update user message content
+      updated[userIdx] = { ...updated[userIdx], content: text };
+      // Reset agent response to empty to show "Thinking..." state (if it exists)
+      if (agentIdx !== -1) {
+        updated[agentIdx] = {
+          ...updated[agentIdx],
+          content: "",
+          reasoningContent: undefined,
+          contentBlocks: undefined,
+        };
+      }
+      return updated;
+    });
+
+    // 2. Call PUT endpoint to do the in-place update on the backend
+    try {
+      setIsSending(true);
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      const tokenMatch = document.cookie.match(/(?:^|;\s*)access_token_lf=([^;]*)/);
+      if (tokenMatch?.[1]) headers["Authorization"] = `Bearer ${decodeURIComponent(tokenMatch[1])}`;
+      const res = await fetch(
+        `${getURL("ORCHESTRATOR")}/messages/${msgIdBeingEdited}/edit`,
+        {
+          method: "PUT",
+          headers,
+          credentials: "include",
+          body: JSON.stringify({
+            edited_text: text,
+            enable_reasoning: cotReasoning,
+            image_mode: imageMode,
+          }),
+        },
+      );
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      // 3. Apply server-returned content for both updated messages
+      setMessages((prev) =>
+        prev.map((m) => {
+          if (data.user_message && m.id === data.user_message.id) {
+            return { ...m, content: data.user_message.text };
+          }
+          if (data.agent_message && m.id === data.agent_message.id) {
+            return {
+              ...m,
+              content: data.agent_message.text,
+              reasoningContent: data.agent_message.reasoning_content || undefined,
+              agentName: data.agent_message.sender_name,
+            };
+          }
+          return m;
+        }),
+      );
+    } catch (err) {
+      console.error("[EditSave] Failed:", err);
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === msgIdBeingEdited ? { ...m, content: text } : m,
+        ),
+      );
+      useAlertStore.getState().setErrorData?.({
+        title: "Failed to edit message",
+        list: [String((err as Error).message || err)],
+      });
+    } finally {
+      setIsSending(false);
+    }
+  }, [editDraft, editingMsgId, cotReasoning, imageMode]);
+
   /* ------------------ SEND MESSAGE ------------------ */
 
-  const handleSend = useCallback(async () => {
+  const handleSend = useCallback(async (overrideText?: string) => {
     const hasFiles = uploadFiles.some((f) => f.path && !f.loading && !f.error);
-    if (!canInteract || (!input.trim() && !hasFiles) || isSending) return;
+    // Accept an optional override text (used by the edit-and-send flow where
+    // React state flush timing is tricky). Falls back to the live `input` state.
+    const effectiveInput = (typeof overrideText === "string" ? overrideText : input);
+    if (!canInteract || (!effectiveInput.trim() && !hasFiles) || isSending || hasPendingHitl) return;
+    // Hide autocomplete suggestions the moment the user submits, AND cancel any
+    // in-flight suggestion fetch so its delayed response can't re-show the dropdown.
+    setSuggestions([]);
+    setShowSuggestions(false);
+    if (suggestionTimerRef.current) clearTimeout(suggestionTimerRef.current);
+    if (suggestionAbortRef.current) suggestionAbortRef.current.abort();
+    if (isSharedReadOnly) {
+      useAlertStore.getState().setErrorData?.({
+        title: "This is a shared read-only conversation",
+        list: ["Start a new chat to continue with your own account."],
+      });
+      return;
+    }
 
     // Outlook intent handling moved to the backend: the MiBuddy-ported
     // intent classifier now returns "outlook_query" for email/calendar
@@ -1344,7 +1646,7 @@ export default function AgentOrchestrator() {
     // Sort by name length descending so "rag agent_new" matches before "rag agent".
     const explicitAgent = [...agents]
       .sort((a, b) => b.name.length - a.name.length)
-      .find((a) => input.includes(`@${a.name}`));
+      .find((a) => effectiveInput.includes(`@${a.name}`));
 
     // If user @mentioned an agent, switch out of noAgentMode and select it
     if (explicitAgent) {
@@ -1362,7 +1664,7 @@ export default function AgentOrchestrator() {
           {
             id: crypto.randomUUID(),
             sender: "user" as const,
-            content: input,
+            content: effectiveInput,
             timestamp: timeNow(),
           },
           {
@@ -1393,8 +1695,8 @@ export default function AgentOrchestrator() {
       ? explicitAgent.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
       : "";
     const cleanedInput = explicitAgent
-      ? input.replace(new RegExp(`@${escapedName}\\s*`, "g"), "").trim()
-      : input.trim();
+      ? effectiveInput.replace(new RegExp(`@${escapedName}\\s*`, "g"), "").trim()
+      : effectiveInput.trim();
 
     // Agent message placeholder — created upfront so "Thinking..." shows inside the bubble
     const agentMsgId = crypto.randomUUID();
@@ -1412,7 +1714,7 @@ export default function AgentOrchestrator() {
     const userMessage: Message = {
       id: crypto.randomUUID(),
       sender: "user",
-      content: input,
+      content: effectiveInput,
       timestamp: timeNow(),
       files: filePaths.length > 0 ? filePaths : undefined,
       canvasEnabled: isCanvasEnabled || undefined,
@@ -1548,6 +1850,28 @@ export default function AgentOrchestrator() {
           const eventType: string = event?.event;
           const data: any = event?.data;
 
+          // MiBuddy-style instant model switch: backend emits a "routing" event
+          // IMMEDIATELY after deciding the destination (mode/model), before the
+          // actual response is generated. Update the dropdown right away so the
+          // user sees the switch without waiting for the full response.
+          if (eventType === "routing") {
+            console.warn("[Orch][routing event]", data);
+            if (noAgentMode && data?.routed_model_id) {
+              const routedId = String(data.routed_model_id);
+              if (routedId !== selectedAiModel) {
+                const match = aiModels.find((m) => m.id === routedId);
+                if (match) setSelectedAiModel(routedId);
+              }
+            } else if (noAgentMode && data?.routed_model_name) {
+              const byName = aiModels.find(
+                (m) => m.name.toLowerCase() === String(data.routed_model_name).toLowerCase(),
+              );
+              if (byName && byName.id !== selectedAiModel) setSelectedAiModel(byName.id);
+            }
+            // Don't early-return — keep the stream consumer alive for later events
+            return true;
+          }
+
           const isHitlEvent =
             eventType === "add_message" &&
             (
@@ -1564,7 +1888,7 @@ export default function AgentOrchestrator() {
               : extractHitlActions(String(data?.text || data?.message || ""));
             const threadId: string = data?.properties?.thread_id ?? currentSessionId ?? "";
             const hitlText: string = data.text || data.message || "";
-            const isDeployedRun: boolean = data?.properties?.is_deployed_run ?? true;
+            const isDeployedRun: boolean = data?.properties?.is_deployed_run ?? false;
             flushSync(() => {
               setStreamingAgentName("");
               setMessages((prev) =>
@@ -1655,6 +1979,37 @@ export default function AgentOrchestrator() {
                 ),
               );
             }
+            // Auto-switch the model dropdown to the model that ACTUALLY produced
+            // the response. Happens when smart router or intent classifier routed
+            // to a different model than the one the user selected (e.g. user picked
+            // "MiBuddy AI" → router picked "gpt-5.1-chat" → dropdown updates to
+            // "gpt-5.1-chat" so the user knows subsequent messages will use it).
+            if (noAgentMode && data?.routed_model_id) {
+              const routedId = data.routed_model_id;
+              if (routedId !== selectedAiModel) {
+                const match = aiModels.find((m) => m.id === routedId);
+                if (match) setSelectedAiModel(routedId);
+              }
+            } else if (noAgentMode && data?.routed_model_name) {
+              // Fallback: match by display name if no id is present
+              const byName = aiModels.find(
+                (m) => m.name.toLowerCase() === String(data.routed_model_name).toLowerCase(),
+              );
+              if (byName && byName.id !== selectedAiModel) setSelectedAiModel(byName.id);
+            }
+
+            // Also auto-enable image mode if an image was returned
+            const finalText = data?.agent_text || "";
+            const hasGeneratedImage = /!\[[^\]]*\]\([^)]+\)/.test(finalText);
+            if (hasGeneratedImage && noAgentMode) {
+              const imageModel = aiModels.find((m) =>
+                /nano[\s_-]?banana|dall[\s_-]?e|flash[\s_-]?image|image[\s_-]?gen/i.test(m.name)
+              );
+              if (imageModel && imageModel.id !== selectedAiModel) {
+                setSelectedAiModel(imageModel.id);
+                // image_mode useEffect will auto-enable the chip
+              }
+            }
             // End event carries the final complete text — flush immediately.
             // BUT: if we received a HITL pause, do NOT overwrite the HITL
             // message with agent_text — the action buttons must stay visible.
@@ -1734,7 +2089,12 @@ export default function AgentOrchestrator() {
       setStreamingAgentName("");
       setStreamingMsgId(null);
     }
-  }, [canInteract, input, isSending, agents, selectedAgent, selectedModelId, noAgentMode, selectedAiModel, currentSessionId, effectiveSessionId, refetchSessions, refetchMessages, imageMode, cotReasoning]);
+  }, [canInteract, input, isSending, hasPendingHitl, agents, selectedAgent, selectedModelId, noAgentMode, selectedAiModel, currentSessionId, effectiveSessionId, refetchSessions, refetchMessages, imageMode, cotReasoning]);
+
+  // Keep the ref updated so handleSaveEdit can call the latest handleSend
+  useEffect(() => {
+    handleSendRef.current = handleSend;
+  }, [handleSend]);
 
   /* ------------------ SESSION MANAGEMENT ------------------ */
 
@@ -1745,11 +2105,13 @@ export default function AgentOrchestrator() {
     setSelectedModelId("");
     setNoAgentMode(true);
     setShowImageGallery(false);
+    setIsSharedReadOnly(false);
   };
 
   const handleSelectSession = (sessionId: string) => {
     setActiveSessionId(sessionId);
     setShowImageGallery(false);
+    setIsSharedReadOnly(false);
   };
 
   /* ──────────── Session rename / share (MiBuddy-parity helpers) ────────────
@@ -1806,14 +2168,17 @@ export default function AgentOrchestrator() {
   };
 
   const handleShareSession = async (sessionId: string) => {
-    const url = `${window.location.origin}${window.location.pathname}?session=${encodeURIComponent(sessionId)}`;
+    // MiBuddy-parity share: the link opens the orchestrator page with
+    // `?session=<id>` selected. If the recipient is already signed in,
+    // the session loads immediately. If not, ProtectedRoute bounces them
+    // to login and returns to the same URL afterwards.
+    const url = `${window.location.origin}/orchestrator-chat?session=${encodeURIComponent(sessionId)}`;
     try {
       await navigator.clipboard.writeText(url);
       useAlertStore.getState().setSuccessData?.({
         title: t("Share link copied to clipboard"),
       });
     } catch {
-      // Fallback: prompt the user so they can copy manually.
       window.prompt(t("Copy this share link:"), url);
     }
   };
@@ -2308,6 +2673,11 @@ export default function AgentOrchestrator() {
               setShowPlusMenu(false);
               setImageMode(true);
               setIsCanvasEnabled(false);
+              // Auto-switch to the image-generation model (Nano Banana / DALL-E / etc.)
+              const imageModel = aiModels.find((m) =>
+                /nano[\s_-]?banana|dall[\s_-]?e|flash[\s_-]?image|image[\s_-]?gen/i.test(m.name)
+              );
+              if (imageModel) setSelectedAiModel(imageModel.id);
             }}
             className="flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
           >
@@ -2753,6 +3123,11 @@ export default function AgentOrchestrator() {
         {/* ================ MESSAGES ================ */}
         <div className="flex flex-1 flex-col items-center overflow-y-auto">
           <div className="w-full max-w-3xl px-6 pb-44 pt-6">
+            {isSharedReadOnly && (
+              <div className="mb-4 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-700 dark:bg-amber-900/30 dark:text-amber-200">
+                {t("Shared conversation — read only. Start a new chat to continue on your own account.")}
+              </div>
+            )}
             {messages.map((msg, idx) => {
               // Context reset divider
               if (msg.category === "context_reset") {
@@ -2844,32 +3219,93 @@ export default function AgentOrchestrator() {
                         <span className="text-sm text-muted-foreground">{t("Thinking...")}</span>
                       </div>
                     ) : isUser ? (
-                      <div className="text-[15px] leading-relaxed text-foreground/80">
-                        {highlightMentions(msg.content)}
-                        {msg.files && msg.files.length > 0 && (
-                          <div className="mt-2 flex flex-wrap gap-2">
-                            {msg.files.map((filePath, idx) => {
-                              const ext = filePath.split(".").pop()?.toLowerCase() || "";
-                              const isImage = ["png", "jpg", "jpeg", "gif", "webp", "bmp"].includes(ext);
-                              const fileName = filePath.split("/").pop() || filePath;
-                              return isImage ? (
-                                <img
-                                  key={idx}
-                                  src={`${BASE_URL_API}files/images/${filePath}`}
-                                  alt="uploaded"
-                                  className="max-h-48 max-w-xs rounded-lg border border-border object-contain"
-                                />
-                              ) : (
-                                <div
-                                  key={idx}
-                                  className="flex items-center gap-2 rounded-lg border border-border bg-muted/50 px-3 py-2 text-xs text-muted-foreground"
-                                >
-                                  <FileText size={16} />
-                                  <span className="max-w-[200px] truncate" title={fileName}>{fileName}</span>
-                                </div>
-                              );
-                            })}
+                      <div className="group/usermsg text-[15px] leading-relaxed text-foreground/80">
+                        {editingMsgId === msg.id && noAgentMode ? (
+                          // Inline editor — matches MiBuddy's UX: textarea + Cancel/Send buttons
+                          <div className="rounded-xl border border-border bg-muted/30 p-3">
+                            <textarea
+                              value={editDraft}
+                              onChange={(e) => setEditDraft(e.target.value)}
+                              autoFocus
+                              rows={3}
+                              className="w-full resize-none border-none bg-transparent text-[15px] text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-0"
+                              placeholder={t("Edit your prompt...")}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter" && !e.shiftKey) {
+                                  e.preventDefault();
+                                  handleSaveEdit();
+                                } else if (e.key === "Escape") {
+                                  e.preventDefault();
+                                  handleCancelEdit();
+                                }
+                              }}
+                            />
+                            <div className="mt-2 flex justify-end gap-2">
+                              <button
+                                onClick={handleCancelEdit}
+                                className="rounded-lg bg-gray-100 px-4 py-1.5 text-sm font-medium text-gray-700 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
+                              >
+                                {t("Cancel")}
+                              </button>
+                              <button
+                                onClick={handleSaveEdit}
+                                disabled={!editDraft.trim() || isSending}
+                                className="rounded-lg bg-red-500 px-4 py-1.5 text-sm font-medium text-white hover:bg-red-600 disabled:cursor-not-allowed disabled:opacity-50"
+                              >
+                                {t("Send")}
+                              </button>
+                            </div>
                           </div>
+                        ) : (
+                          <>
+                            {highlightMentions(msg.content)}
+                            {msg.files && msg.files.length > 0 && (
+                              <div className="mt-2 flex flex-wrap gap-2">
+                                {msg.files.map((filePath, idx) => {
+                                  const ext = filePath.split(".").pop()?.toLowerCase() || "";
+                                  const isImage = ["png", "jpg", "jpeg", "gif", "webp", "bmp"].includes(ext);
+                                  const fileName = filePath.split("/").pop() || filePath;
+                                  return isImage ? (
+                                    <img
+                                      key={idx}
+                                      src={`${BASE_URL_API}files/images/${filePath}`}
+                                      alt="uploaded"
+                                      className="max-h-48 max-w-xs rounded-lg border border-border object-contain"
+                                    />
+                                  ) : (
+                                    <div
+                                      key={idx}
+                                      className="flex items-center gap-2 rounded-lg border border-border bg-muted/50 px-3 py-2 text-xs text-muted-foreground"
+                                    >
+                                      <FileText size={16} />
+                                      <span className="max-w-[200px] truncate" title={fileName}>{fileName}</span>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            )}
+                            {/* Prompt action buttons — Copy and Edit
+                                Shown ONLY in model mode (No Agent), not when chatting with an agent.
+                                Always visible (no hover-only) — matches MiBuddy UX. */}
+                            {msg.content && !isSending && noAgentMode && (
+                              <div className="mt-1.5 flex items-center gap-1">
+                                <button
+                                  onClick={() => handleCopyMessage(msg.content, msg.id)}
+                                  className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
+                                  title={copiedMsgId === msg.id ? t("Copied!") : t("Copy")}
+                                >
+                                  {copiedMsgId === msg.id ? <Check size={13} className="text-green-600" /> : <Copy size={13} />}
+                                </button>
+                                <button
+                                  onClick={() => handleStartEdit(msg.id, msg.content)}
+                                  className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
+                                  title={t("Edit prompt")}
+                                >
+                                  <Pencil size={13} />
+                                </button>
+                              </div>
+                            )}
+                          </>
                         )}
                       </div>
                     ) : (
@@ -3143,8 +3579,8 @@ export default function AgentOrchestrator() {
                   ))}
                 </div>
               )}
-              {/* Autocomplete suggestions dropdown */}
-              {showSuggestions && suggestions.length > 0 && noAgentMode && (
+              {/* Autocomplete suggestions dropdown — hide while response is generating */}
+              {showSuggestions && suggestions.length > 0 && noAgentMode && !isSending && (
                 <div className="border-b border-border px-2 py-1.5">
                   {suggestions.map((s, i) => (
                     <div
@@ -3212,19 +3648,27 @@ export default function AgentOrchestrator() {
 
               {/* Single-line input row: [+] [img] [textarea grows] [mic] [send] */}
               <div className="flex items-center gap-1 px-3 py-2">
-                {/* ---- Addon: Plus menu button ---- */}
+                {/* ---- Addon: Plus menu button ----
+                    In AGENT mode: directly opens the file picker (simpler UX).
+                    In MODEL (No Agent) mode: opens the full menu with Create image, Canvas, etc. */}
                 <div data-plus-menu className="shrink-0">
                   <button
                     onClick={(e) => {
+                      // Agent mode — open file explorer directly
+                      if (!noAgentMode) {
+                        fileInputRef.current?.click();
+                        return;
+                      }
+                      // Model mode — toggle the options menu
                       if (!showPlusMenu) {
                         const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
                         setPlusMenuPos({ bottom: window.innerHeight - rect.top + 8, left: rect.left });
                       }
                       setShowPlusMenu(!showPlusMenu);
                     }}
-                    disabled={isSending || !canInteract}
-                    className={`flex h-9 w-9 items-center justify-center rounded-full text-muted-foreground transition-colors ${(isSending || !canInteract) ? "cursor-not-allowed opacity-50" : "hover:bg-accent hover:text-foreground"}`}
-                    title={t("More options")}
+                    disabled={isSending || !canInteract || isSharedReadOnly || hasPendingHitl}
+                    className={`flex h-9 w-9 items-center justify-center rounded-full text-muted-foreground transition-colors ${(isSending || !canInteract || isSharedReadOnly || hasPendingHitl) ? "cursor-not-allowed opacity-50" : "hover:bg-accent hover:text-foreground"}`}
+                    title={noAgentMode ? t("More options") : t("Upload files")}
                   >
                     <Plus size={18} />
                   </button>
@@ -3233,8 +3677,8 @@ export default function AgentOrchestrator() {
                 {/* Upload image button */}
                 <button
                   onClick={() => fileInputRef.current?.click()}
-                  disabled={isSending || !canInteract}
-                  className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors ${(isSending || !canInteract) ? "cursor-not-allowed opacity-50" : "hover:bg-accent hover:text-foreground"}`}
+                  disabled={isSending || !canInteract || isSharedReadOnly || hasPendingHitl}
+                  className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors ${(isSending || !canInteract || isSharedReadOnly || hasPendingHitl) ? "cursor-not-allowed opacity-50" : "hover:bg-accent hover:text-foreground"}`}
                   title={t("Upload image")}
                 >
                   <ImagePlus size={18} />
@@ -3245,7 +3689,7 @@ export default function AgentOrchestrator() {
                   value={input}
                   onChange={(e) => handleInputChange(e.target.value)}
                   onPaste={handlePaste}
-                  disabled={isSending || !canInteract}
+                  disabled={isSending || !canInteract || isSharedReadOnly || hasPendingHitl}
                   onKeyDown={(e) => {
                     if (showSuggestions && suggestions.length > 0) {
                       if (e.key === "ArrowDown") {
@@ -3276,14 +3720,18 @@ export default function AgentOrchestrator() {
                     }
                   }}
                   placeholder={
-                    !canInteract
-                      ? t("You do not have permission to interact with agents.")
-                      : isSending
-                        ? t("Waiting for response...")
-                        : t("Start typing with @ to chat with an agent")
+                    isSharedReadOnly
+                      ? t("Read-only shared conversation")
+                      : !canInteract
+                        ? t("You do not have permission to interact with agents.")
+                        : hasPendingHitl
+                          ? t("Waiting for human review — approve or reject to continue")
+                          : isSending
+                            ? t("Waiting for response...")
+                            : t("Start typing with @ to chat with an agent")
                   }
                   rows={1}
-                  className={`min-w-0 flex-1 resize-none border-none bg-transparent px-2 py-1.5 text-[15px] leading-6 text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-0 ${(isSending || !canInteract) ? "cursor-not-allowed opacity-50" : ""}`}
+                  className={`min-w-0 flex-1 resize-none border-none bg-transparent px-2 py-1.5 text-[15px] leading-6 text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-0 ${(isSending || !canInteract || isSharedReadOnly || hasPendingHitl) ? "cursor-not-allowed opacity-50" : ""}`}
                 />
 
                 <input
@@ -3298,11 +3746,11 @@ export default function AgentOrchestrator() {
                 {/* Mic */}
                 <button
                   onClick={handleMicClick}
-                  disabled={isSending || !canInteract}
+                  disabled={isSending || !canInteract || isSharedReadOnly || hasPendingHitl}
                   className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full transition-colors ${
                     isListening
                       ? "bg-red-500 text-white animate-pulse"
-                      : (isSending || !canInteract)
+                      : (isSending || !canInteract || isSharedReadOnly || hasPendingHitl)
                         ? "cursor-not-allowed text-muted-foreground opacity-50"
                         : "text-muted-foreground hover:bg-accent hover:text-foreground"
                   }`}
@@ -3311,12 +3759,12 @@ export default function AgentOrchestrator() {
                   {isListening ? <AudioLines size={18} /> : <Mic size={18} />}
                 </button>
 
-                {/* Send */}
+                {/* Send — wrap in arrow fn so React's MouseEvent isn't passed as the override text */}
                 <button
-                  onClick={handleSend}
-                  disabled={(!input.trim() && !uploadFiles.some((f) => f.path)) || isSending || !canInteract}
+                  onClick={() => handleSend()}
+                  disabled={(!input.trim() && !uploadFiles.some((f) => f.path)) || isSending || !canInteract || isSharedReadOnly || hasPendingHitl}
                   className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full transition-colors ${
-                    (input.trim() || uploadFiles.some((f) => f.path)) && !isSending && canInteract
+                    (input.trim() || uploadFiles.some((f) => f.path)) && !isSending && canInteract && !isSharedReadOnly && !hasPendingHitl
                       ? "bg-foreground text-background hover:opacity-90"
                       : "bg-muted text-muted-foreground"
                   }`}
