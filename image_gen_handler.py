@@ -70,10 +70,13 @@ async def _save_generated_image(
 ) -> str:
     """Save a generated image to storage and create a File DB record.
 
-    Returns a URL the frontend can render:
-    - If the Azure Blob container has public access → returns the RAW BLOB URL
-      (MiBuddy-style, shareable without auth)
-    - Otherwise → returns the authenticated proxy URL: /api/files/images/...
+    Returns the authenticated proxy URL: /api/files/images/{user_id}/{file_name}
+    The frontend loads this URL with JWT auth, so it works regardless of
+    whether the blob container is public or private.
+
+    For external sharing, callers should separately resolve the public blob
+    URL via get_public_blob_url(file_path) when the container has public
+    access configured.
     """
     from datetime import datetime, timezone
     from uuid import uuid4
@@ -83,7 +86,6 @@ async def _save_generated_image(
     from agentcore.services.mibuddy.docqa_storage import (
         save_file as mibuddy_save,
         FileCategory,
-        get_public_blob_url,
     )
 
     # Generate filename
@@ -111,12 +113,6 @@ async def _save_generated_image(
     except Exception as e:
         logger.warning(f"[ImageGen] Failed to save image to DB: {e}")
 
-    # Prefer the raw Azure Blob URL (MiBuddy-style) — shareable without auth
-    # when the container is configured for public blob access. Falls back to
-    # the authenticated proxy URL if blob storage isn't set up.
-    public_url = await get_public_blob_url(file_path)
-    if public_url:
-        return public_url
     return f"/api/files/images/{user_id}/{file_name}"
 
 
