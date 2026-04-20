@@ -70,14 +70,21 @@ async def _save_generated_image(
 ) -> str:
     """Save a generated image to storage and create a File DB record.
 
-    Returns the local serving URL: /files/images/{user_id}/{filename}
+    Returns a URL the frontend can render:
+    - If the Azure Blob container has public access → returns the RAW BLOB URL
+      (MiBuddy-style, shareable without auth)
+    - Otherwise → returns the authenticated proxy URL: /api/files/images/...
     """
     from datetime import datetime, timezone
     from uuid import uuid4
 
     from agentcore.services.deps import session_scope
     from agentcore.services.database.models.file.model import File as UserFile
-    from agentcore.services.mibuddy.docqa_storage import save_file as mibuddy_save, FileCategory
+    from agentcore.services.mibuddy.docqa_storage import (
+        save_file as mibuddy_save,
+        FileCategory,
+        get_public_blob_url,
+    )
 
     # Generate filename
     ts = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
@@ -88,7 +95,6 @@ async def _save_generated_image(
     file_size = len(image_bytes)
 
     # Create DB record so it appears in My Images gallery
-    # Name must be unique (DB constraint) — use filename which already has timestamp + random hex
     display_name = file_name
     try:
         async with session_scope() as db:
@@ -105,8 +111,12 @@ async def _save_generated_image(
     except Exception as e:
         logger.warning(f"[ImageGen] Failed to save image to DB: {e}")
 
-    # URL must be /api/files/images/{user_id}/{filename} (two segments only)
-    # The serving endpoint fallback searches generated-images/ folder automatically
+    # Prefer the raw Azure Blob URL (MiBuddy-style) — shareable without auth
+    # when the container is configured for public blob access. Falls back to
+    # the authenticated proxy URL if blob storage isn't set up.
+    public_url = await get_public_blob_url(file_path)
+    if public_url:
+        return public_url
     return f"/api/files/images/{user_id}/{file_name}"
 
 
@@ -337,7 +347,14 @@ async def _generate_dalle_openai(prompt: str, config: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 async def _generate_dalle_azure(prompt: str, config: dict) -> dict:
-    """Generate image via Azure OpenAI DALL-E API using registry config."""
+    """Generate image via Azure OpenAI DALL-E using the OpenAI Python SDK
+    (matches MiBuddy's exact approach). Returns base64 decoded and uses b64_json
+    response format like MiBuddy.
+    """
+    import asyncio
+    import base64
+    from openai import AzureOpenAI
+
     prompt = _apply_safety_to_prompt(prompt)
     api_key = config.get("api_key", "")
     provider_config = config.get("provider_config", {})
@@ -348,29 +365,53 @@ async def _generate_dalle_azure(prompt: str, config: dict) -> dict:
     if not endpoint:
         raise ValueError("Azure DALL-E model missing base_url / azure_endpoint in registry.")
 
-    url = f"{endpoint.rstrip('/')}/openai/deployments/{deployment}/images/generations?api-version={api_version}"
-    headers = {"api-key": api_key, "Content-Type": "application/json"}
-    payload = {
-        "prompt": prompt,
-        "size": "1024x1024",
-        "n": 1,
-        "response_format": "url",
-    }
+    logger.info(f"[DALL-E Azure] endpoint={endpoint}, deployment={deployment}, api_version={api_version}")
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        resp = await client.post(url, json=payload, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
+    def _call_sdk():
+        client = AzureOpenAI(
+            api_key=api_key,
+            api_version=api_version,
+            azure_endpoint=endpoint,
+            timeout=60.0,
+        )
+        return client.images.generate(
+            model=deployment,
+            prompt=prompt,
+            size="1024x1024",
+            response_format="b64_json",
+        )
 
-    image_url = ""
-    if data.get("data") and len(data["data"]) > 0:
-        image_url = data["data"][0].get("url", "")
+    try:
+        result = await asyncio.to_thread(_call_sdk)
 
-    if image_url:
-        text = f"![Generated Image]({image_url})"
-        return {"response_text": text, "model_name": deployment}
+        # Prefer base64 (what MiBuddy uses)
+        b64 = getattr(result.data[0], "b64_json", None)
+        if b64:
+            # Build data URL so frontend can render directly
+            data_url = f"data:image/png;base64,{b64}"
+            return {"response_text": f"![Generated Image]({data_url})", "model_name": deployment}
 
-    return {"response_text": "Image generation completed but no image was returned.", "model_name": deployment}
+        # Fallback: URL response
+        url_out = getattr(result.data[0], "url", None)
+        if url_out:
+            return {"response_text": f"![Generated Image]({url_out})", "model_name": deployment}
+
+        return {"response_text": "Image generation completed but no image was returned.", "model_name": deployment}
+    except Exception as e:
+        error_str = str(e).lower()
+        logger.error(f"[DALL-E Azure] Failed: {type(e).__name__}: {e}")
+        # Graceful messages per error type (matches MiBuddy's user-friendly fallbacks)
+        if "deprecated" in error_str or "410" in error_str:
+            msg = "This image model is no longer available. Please use Nano Banana or contact your admin."
+        elif "safety" in error_str or "unsafe" in error_str or "content_policy" in error_str:
+            msg = "Image could not be generated due to content safety filters. Try a different prompt."
+        elif "timeout" in error_str or "503" in error_str or "service unavailable" in error_str:
+            msg = "Image service is temporarily unavailable. Please try again in a moment."
+        elif "bad request" in error_str or "invalid" in error_str:
+            msg = "Unable to generate this image. Please rephrase your prompt."
+        else:
+            msg = f"Image generation failed: {e}"
+        return {"response_text": msg, "model_name": deployment}
 
 
 # ---------------------------------------------------------------------------

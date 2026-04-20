@@ -2846,18 +2846,30 @@ async def list_generated_images(
     *,
     current_user: CurrentActiveUser,
 ):
-    """List AI-generated images for the current user from the MiBuddy container."""
+    """List AI-generated images for the current user from the MiBuddy container.
+
+    Returns raw Azure Blob URLs (MiBuddy-style) when the container is configured
+    for public blob access — shareable without auth. Falls back to auth-proxied
+    URLs when blob storage isn't configured.
+    """
     try:
-        from agentcore.services.mibuddy.docqa_storage import list_files, FileCategory
+        from agentcore.services.mibuddy.docqa_storage import (
+            list_files,
+            FileCategory,
+            get_public_blob_url,
+        )
 
         user_id = str(current_user.id)
         file_names = await list_files(user_id, category=FileCategory.GENERATED_IMAGES)
 
         images = []
         for name in sorted(file_names, reverse=True)[:20]:  # newest first, max 20
+            blob_path = f"{user_id}/generated-images/{name}"
+            public_url = await get_public_blob_url(blob_path)
+            src = public_url or f"/api/files/images/{user_id}/generated-images/{name}"
             images.append({
                 "name": name,
-                "src": f"/api/files/images/{user_id}/generated-images/{name}",
+                "src": src,
             })
         return images
     except Exception as e:

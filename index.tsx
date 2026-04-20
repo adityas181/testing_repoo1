@@ -1,6 +1,6 @@
 import { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
-import { Send, Sparkles, ChevronDown, Plus, MessageSquare, PanelLeftClose, PanelLeft, User, Loader2, Trash2, Check, ImagePlus, X, Clock, Search, Image, Archive, ChevronRight, Globe, BookOpen, Headphones, Info, HelpCircle, Mic, AudioLines, FileUp, Paintbrush, Lightbulb, Upload, MoreVertical, Folder, ArrowLeft, File, FileText, Shield, CheckCircle2, SquarePen, Mail, Download, Copy, Pencil } from "lucide-react";
+import { Send, Sparkles, ChevronDown, Plus, MessageSquare, PanelLeftClose, PanelLeft, User, Loader2, Trash2, Check, ImagePlus, X, Clock, Search, Image, Archive, ChevronRight, Globe, BookOpen, Headphones, Info, HelpCircle, Mic, AudioLines, FileUp, Paintbrush, Lightbulb, Upload, MoreVertical, Folder, ArrowLeft, File, FileText, Shield, CheckCircle2, SquarePen, Mail, Download, Copy, Pencil, Share2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import {
   useGetOrchAgents,
@@ -423,15 +423,17 @@ function ImageGalleryView({
 
   const handleDownload = async (src: string, name: string) => {
     try {
-      // Authenticated endpoints (/api/orchestrator/images/...) require JWT header.
-      // Plain fetch(src) fails silently → falls back to window.open which just
-      // opens/expands the image instead of downloading it.
+      // MiBuddy-style: public blob URLs (https://...blob.core.windows.net/...) need
+      // no auth. Our proxied /api/... URLs need JWT. Auto-detect which applies.
+      const isPublicBlob = /\.blob\.core\.windows\.net\//i.test(src);
       const headers: Record<string, string> = {};
-      const tokenMatch = document.cookie.match(/(?:^|;\s*)access_token_lf=([^;]*)/);
-      if (tokenMatch?.[1]) {
-        headers["Authorization"] = `Bearer ${decodeURIComponent(tokenMatch[1])}`;
+      if (!isPublicBlob) {
+        const tokenMatch = document.cookie.match(/(?:^|;\s*)access_token_lf=([^;]*)/);
+        if (tokenMatch?.[1]) {
+          headers["Authorization"] = `Bearer ${decodeURIComponent(tokenMatch[1])}`;
+        }
       }
-      const res = await fetch(src, { headers, credentials: "include" });
+      const res = await fetch(src, isPublicBlob ? {} : { headers, credentials: "include" });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
@@ -455,6 +457,59 @@ function ImageGalleryView({
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
+    }
+  };
+
+  // Share a generated image using the browser's native Web Share API.
+  // Windows/iOS/Android will open the OS-level share sheet (WhatsApp, Teams,
+  // Outlook, Gmail, LinkedIn, etc.). Firefox / older browsers fall back to
+  // copying the image URL to the clipboard.
+  const handleShare = async (src: string, name: string) => {
+    const title = name || "Generated Image";
+    try {
+      // Try sharing the actual image file (better UX — shared as a file attachment
+      // instead of just a link). Works on mobile & modern desktop browsers.
+      // Public blob URLs don't need auth; our /api/... proxied URLs do.
+      const isPublicBlob = /\.blob\.core\.windows\.net\//i.test(src);
+      const headers: Record<string, string> = {};
+      if (!isPublicBlob) {
+        const tokenMatch = document.cookie.match(/(?:^|;\s*)access_token_lf=([^;]*)/);
+        if (tokenMatch?.[1]) {
+          headers["Authorization"] = `Bearer ${decodeURIComponent(tokenMatch[1])}`;
+        }
+      }
+      const res = await fetch(src, isPublicBlob ? {} : { headers, credentials: "include" });
+      if (res.ok) {
+        const blob = await res.blob();
+        const file = new File([blob], name || `image-${Date.now()}.png`, {
+          type: blob.type || "image/png",
+        });
+        if ((navigator as any).canShare?.({ files: [file] })) {
+          await (navigator as any).share({ title, files: [file] });
+          return;
+        }
+      }
+    } catch (err) {
+      console.warn("[handleShare] File share failed, falling back to URL:", err);
+    }
+    // Fallback 1: share the URL (still triggers OS share sheet on supported browsers)
+    try {
+      if ((navigator as any).share) {
+        await (navigator as any).share({ title, url: src });
+        return;
+      }
+    } catch (err) {
+      console.warn("[handleShare] URL share failed, falling back to clipboard:", err);
+    }
+    // Fallback 2: copy URL to clipboard (browsers without Web Share API)
+    try {
+      await navigator.clipboard.writeText(src);
+      useAlertStore.getState().setSuccessData?.({ title: "Image link copied to clipboard" });
+    } catch {
+      useAlertStore.getState().setErrorData?.({
+        title: "Unable to share",
+        list: ["Your browser doesn't support sharing. Please copy the link manually."],
+      });
     }
   };
 
@@ -505,13 +560,23 @@ function ImageGalleryView({
                 </div>
                 <div className="absolute inset-0 flex flex-col justify-end bg-gradient-to-t from-black/60 via-transparent to-transparent opacity-0 transition-opacity group-hover:opacity-100">
                   <div className="flex items-center justify-between p-3">
-                    <span className="max-w-[70%] truncate text-xs font-medium text-white">{img.name}</span>
-                    <button
-                      onClick={(e) => { e.stopPropagation(); handleDownload(img.src, img.name); }}
-                      className="rounded-full bg-white/20 p-1.5 text-white backdrop-blur-sm hover:bg-white/40"
-                    >
-                      <Download size={14} />
-                    </button>
+                    <span className="max-w-[60%] truncate text-xs font-medium text-white">{img.name}</span>
+                    <div className="flex items-center gap-1">
+                      <button
+                        onClick={(e) => { e.stopPropagation(); handleShare(img.src, img.name); }}
+                        className="rounded-full bg-white/20 p-1.5 text-white backdrop-blur-sm hover:bg-white/40"
+                        title="Share"
+                      >
+                        <Share2 size={14} />
+                      </button>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); handleDownload(img.src, img.name); }}
+                        className="rounded-full bg-white/20 p-1.5 text-white backdrop-blur-sm hover:bg-white/40"
+                        title="Download"
+                      >
+                        <Download size={14} />
+                      </button>
+                    </div>
                   </div>
                 </div>
                 {img.createdAt && (
@@ -535,6 +600,10 @@ function ImageGalleryView({
             <img src={selectedImage.src} alt={selectedImage.name} className="max-h-[80vh] max-w-[85vw] rounded-lg object-contain" />
             <div className="mt-4 flex items-center gap-4">
               <span className="max-w-xs truncate text-sm text-white/80">{selectedImage.name}</span>
+              <button onClick={() => handleShare(selectedImage.src, selectedImage.name)} className="flex items-center gap-2 rounded-lg bg-white/10 px-4 py-2 text-sm text-white backdrop-blur-sm hover:bg-white/20">
+                <Share2 size={16} />
+                {t("Share")}
+              </button>
               <button onClick={() => handleDownload(selectedImage.src, selectedImage.name)} className="flex items-center gap-2 rounded-lg bg-white/10 px-4 py-2 text-sm text-white backdrop-blur-sm hover:bg-white/20">
                 <Download size={16} />
                 {t("Download")}
