@@ -2411,51 +2411,202 @@ async def edit_orch_message(
         session.add(user_msg)
         await session.flush()
 
-        # 4. Regenerate response. We call direct_model_chat with the edited prompt.
-        # We use the same model that generated the original response.
-        resp_model_id = getattr(agent_msg, "model_id", None) if agent_msg else None
-        if not resp_model_id:
-            resp_model_id = user_msg.model_id if hasattr(user_msg, "model_id") else None
-        if not resp_model_id:
-            # Last-resort fallback
-            settings = get_settings_service().settings
-            if settings.default_chat_model_id:
-                resp_model_id = UUID(settings.default_chat_model_id)
+        # 4. Re-run intent classification on the edited prompt so the regenerated
+        # response goes through the correct mode handler (doc_qa, web_search,
+        # outlook_query, image_gen, kb_search, model_direct) — not always plain
+        # model chat. Previously the edit bypassed routing entirely and every
+        # edit regenerated as model_direct, losing doc/web/outlook/image features.
+        original_model_id = getattr(agent_msg, "model_id", None) if agent_msg else None
+        if not original_model_id:
+            original_model_id = getattr(user_msg, "model_id", None)
+        if not original_model_id:
+            settings_fallback = get_settings_service().settings
+            if settings_fallback.default_chat_model_id:
+                original_model_id = UUID(settings_fallback.default_chat_model_id)
 
-        if not resp_model_id:
+        if not original_model_id:
             raise HTTPException(
                 status_code=400,
                 detail="Cannot regenerate: no model_id associated with this conversation.",
             )
 
-        # Call direct_model_chat with ONLY the edited user prompt (MiBuddy behavior —
-        # no prior history included in regeneration context).
-        from agentcore.services.mibuddy.direct_model_chat import direct_model_chat
-        result = await direct_model_chat(
-            model_id=str(resp_model_id),
-            input_value=body.edited_text,
+        # Synthesise a request that mirrors what would have arrived if the user
+        # had typed this as a new message. Keep original files so doc_qa picks
+        # them up again; carry the request's reasoning / image-mode flags.
+        synthetic_body = OrchChatRequest(
             session_id=user_msg.session_id,
-            files=None,
+            model_id=original_model_id,
+            input_value=body.edited_text,
+            files=user_msg.files if user_msg.files else None,
             enable_reasoning=body.enable_reasoning,
+            image_mode=body.image_mode,
         )
-        new_response_text = result.get("response_text", "")
-        new_reasoning = result.get("reasoning_content")
-        new_model_name = result.get("model_name", "")
+        routing = await _route_request(session, current_user, synthetic_body)
+        mode = routing["mode"]
+        resp_model_id = routing.get("model_id") or original_model_id
+        intent = routing.get("intent")
 
-        # 5. Update the agent message in-place (if one exists) or create a new one
+        new_response_text = ""
+        new_reasoning: str | None = None
+        new_model_name = ""
+        regen_sender_name = "Assistant"
+
+        if mode == "model_direct":
+            from agentcore.services.mibuddy.direct_model_chat import direct_model_chat
+            result = await direct_model_chat(
+                model_id=str(resp_model_id),
+                input_value=body.edited_text,
+                session_id=user_msg.session_id,
+                files=synthetic_body.files,
+                enable_reasoning=body.enable_reasoning,
+            )
+            new_response_text = result.get("response_text", "")
+            new_reasoning = result.get("reasoning_content")
+            new_model_name = result.get("model_name", "")
+            regen_sender_name = await _get_model_display_name(session, resp_model_id)
+
+        elif mode == "kb_search":
+            from agentcore.services.mibuddy.kb_search_handler import handle_kb_search
+            result = await handle_kb_search(body.edited_text)
+            new_response_text = result.get("response_text", "")
+            new_model_name = result.get("model_name", "knowledge-base")
+            settings_svc = get_settings_service().settings
+            regen_sender_name = settings_svc.company_kb_name or "Knowledge Base"
+
+        elif mode == "web_search":
+            from agentcore.services.mibuddy.web_search_handler import handle_web_search
+            from agentcore.services.mibuddy.system_prompts import get_system_identity_prompt
+            result = await handle_web_search(body.edited_text, system_message=get_system_identity_prompt())
+            new_response_text = result.get("response_text", "")
+            new_model_name = result.get("model_name", "gemini")
+            if intent == "web_search_explicit" and resp_model_id:
+                regen_sender_name = await _get_model_display_name(session, resp_model_id)
+            else:
+                settings_svc = get_settings_service().settings
+                regen_sender_name = settings_svc.web_search_model_name or "Web Search"
+
+        elif mode == "image_gen":
+            from agentcore.services.mibuddy.image_gen_handler import handle_image_generation
+            result = await handle_image_generation(
+                body.edited_text,
+                model_id=str(resp_model_id) if resp_model_id else None,
+                user_id=str(current_user.id),
+            )
+            new_response_text = result.get("response_text", "")
+            new_model_name = result.get("model_name", "image-generation")
+            if intent == "image_generation_explicit" and resp_model_id:
+                regen_sender_name = await _get_model_display_name(session, resp_model_id)
+            else:
+                settings_svc = get_settings_service().settings
+                regen_sender_name = settings_svc.image_gen_model_name or "Image Generator"
+
+        elif mode == "outlook_query":
+            from agentcore.services.mibuddy.outlook_agent import outlook_agent_node
+            state = {
+                "messages": [{"role": "user", "content": body.edited_text}],
+                "user_id": str(current_user.id),
+                "is_canvas_enabled": False,
+            }
+            state = await outlook_agent_node(state)
+            new_response_text = state.get("final_response", "") or (
+                "I couldn't process that Outlook request."
+            )
+            new_model_name = "outlook"
+            regen_sender_name = (
+                await _get_model_display_name(session, resp_model_id)
+                if resp_model_id else "Outlook"
+            )
+
+        elif mode == "document_qa":
+            from agentcore.services.mibuddy.document_processor import (
+                process_and_ingest,
+                search_documents,
+                build_doc_qa_prompt,
+            )
+            from agentcore.services.mibuddy.direct_model_chat import direct_model_chat
+
+            # Newly-attached files are rare on an edit (user usually edits text
+            # only), but handle them anyway for parity with the main chat path.
+            doc_files = routing.get("doc_files", [])
+            if doc_files:
+                count = await process_and_ingest(doc_files, user_msg.session_id)
+                if count > 0:
+                    await asyncio.sleep(5)
+
+            # Session-wide file list so per-file search sees every uploaded doc.
+            file_names_for_search = await _collect_session_doc_filenames(
+                user_msg.session_id, current_user.id,
+            )
+            for p in doc_files:
+                nm = Path(p).name
+                if nm not in file_names_for_search:
+                    file_names_for_search.append(nm)
+
+            chunks = await search_documents(
+                body.edited_text,
+                user_msg.session_id,
+                file_list=file_names_for_search or None,
+            )
+            enriched_prompt = build_doc_qa_prompt(body.edited_text, chunks)
+
+            if not resp_model_id:
+                raise HTTPException(status_code=400, detail="No model selected for document Q&A.")
+            image_files = routing.get("image_files", [])
+            result = await direct_model_chat(
+                model_id=str(resp_model_id),
+                input_value=enriched_prompt,
+                session_id=user_msg.session_id,
+                files=image_files,
+            )
+            new_response_text = result.get("response_text", "")
+            new_reasoning = result.get("reasoning_content")
+            new_model_name = result.get("model_name", "")
+            regen_sender_name = (
+                await _get_model_display_name(session, resp_model_id)
+                if resp_model_id else "Document Q&A"
+            )
+
+        else:
+            # Unknown or "agent" mode — edit doesn't support switching to an
+            # agent deployment on the fly. Fall back to plain model chat.
+            from agentcore.services.mibuddy.direct_model_chat import direct_model_chat
+            result = await direct_model_chat(
+                model_id=str(resp_model_id),
+                input_value=body.edited_text,
+                session_id=user_msg.session_id,
+                files=None,
+                enable_reasoning=body.enable_reasoning,
+            )
+            new_response_text = result.get("response_text", "")
+            new_reasoning = result.get("reasoning_content")
+            new_model_name = result.get("model_name", "")
+            regen_sender_name = await _get_model_display_name(session, resp_model_id)
+
+        if not new_response_text or not new_response_text.strip():
+            new_response_text = "No response was generated. Please try again."
+
+        logger.info(
+            f"[ORCH] Edit {message_id}: mode={mode} intent={intent} "
+            f"model_id={resp_model_id} sender_name={regen_sender_name}"
+        )
+
+        # 5. Update the agent message in-place (if one exists) or create a new one.
+        # Also refresh sender_name + model_id so the UI shows the correct model
+        # for the new mode (e.g. edit flipped from model_direct to image_gen).
         if agent_msg is not None:
             agent_msg.text = new_response_text
+            agent_msg.sender_name = regen_sender_name
+            if hasattr(agent_msg, "model_id") and resp_model_id:
+                agent_msg.model_id = resp_model_id
             if hasattr(agent_msg, "reasoning_content"):
                 agent_msg.reasoning_content = new_reasoning
             session.add(agent_msg)
         else:
             # Edge case: user edited a message that had no response yet.
-            # Create a new model response right after the user message.
-            # sender="model" — edit-regeneration always goes through model-direct.
             agent_msg = OrchConversationTable(
                 id=uuid4(),
                 sender="model",
-                sender_name=await _get_model_display_name(session, resp_model_id),
+                sender_name=regen_sender_name,
                 session_id=user_msg.session_id,
                 text=new_response_text,
                 user_id=user_msg.user_id,
