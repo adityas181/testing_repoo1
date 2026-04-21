@@ -1103,45 +1103,19 @@ async def _route_request(
                 "image_files": image_files,
             }
 
-    # Priority 0.5: User explicitly selected a special model (Web Search, Nano Banana)
-    # Force that mode regardless of intent classification
-    if body.model_id and not body.agent_id and not body.deployment_id:
-        try:
-            from agentcore.services.mibuddy.model_capabilities import detect_capabilities
-            from agentcore.services.database.models.model_registry.model import ModelRegistry
-
-            selected_model = await session.get(ModelRegistry, body.model_id)
-            if selected_model:
-                caps = detect_capabilities(
-                    selected_model.provider,
-                    selected_model.model_name,
-                    selected_model.capabilities,
-                )
-                # If user selected a web_search-capable model → force web search mode
-                # (the model's web_search=true capability means it was registered for grounded answers)
-                if caps.get("web_search"):
-                    logger.info(f"[ORCH] Selected model '{selected_model.display_name}' has web_search capability — forcing web_search mode")
-                    return {
-                        "mode": "web_search",
-                        "agent_id": None,
-                        "deployment_id": None,
-                        "deployment": None,
-                        "model_id": body.model_id,
-                        "intent": "web_search_explicit",
-                    }
-                # If user selected an image gen model → force image generation
-                if caps.get("image_generation"):
-                    logger.info(f"[ORCH] User selected image gen model: {selected_model.display_name}")
-                    return {
-                        "mode": "image_gen",
-                        "agent_id": None,
-                        "deployment_id": None,
-                        "deployment": None,
-                        "model_id": body.model_id,
-                        "intent": "image_generation_explicit",
-                    }
-        except Exception as e:
-            logger.debug(f"[ORCH] Model capability check failed (non-critical): {e}")
+    # Priority 0.5 (removed): previously force-routed to web_search or image_gen
+    # based on the selected model's capability flags. That was too aggressive
+    # for multi-purpose models (e.g. Gemini 3 Pro is registered with
+    # web_search=true but is also used for plain chat and image generation) —
+    # it would push every query through web_search, including "create image"
+    # requests. Routing now relies on:
+    #   - the explicit `image_mode=True` flag (set by the frontend when a
+    #     dedicated image model like Nano Banana is selected) — caught by the
+    #     fast-path below.
+    #   - the intent classifier, which inspects the prompt text.
+    # The dispatch-side "settings override" (web_search_model_name /
+    # image_gen_model_name) swaps the responding model to the configured
+    # specialist when the intent doesn't match the selected model.
 
     # Mode 1: Explicit @agent mention
     if body.agent_id or body.deployment_id:
@@ -1155,7 +1129,11 @@ async def _route_request(
             "intent": None,
         }
 
-    # Fast path: explicit image_mode flag from frontend — skip intent classification
+    # Fast path: explicit image_mode flag from frontend — skip intent classification.
+    # When the user has picked a specific image model (body.model_id set), mark
+    # the intent as "image_generation_explicit" so the dispatch branch uses THAT
+    # model (e.g. DALL-E if the user selected DALL-E) instead of overriding to
+    # settings.image_gen_model_name.
     if body.image_mode:
         logger.info(f"[ORCH] image_mode=true, routing directly to image_gen")
         return {
@@ -1164,7 +1142,7 @@ async def _route_request(
             "deployment_id": None,
             "deployment": None,
             "model_id": body.model_id,
-            "intent": "image_generation",
+            "intent": "image_generation_explicit" if body.model_id else "image_generation",
         }
 
     # Mode 2/3: No @agent — run intent classification
