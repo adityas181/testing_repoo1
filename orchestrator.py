@@ -2419,12 +2419,24 @@ async def edit_orch_message(
         original_model_id = getattr(agent_msg, "model_id", None) if agent_msg else None
         if not original_model_id:
             original_model_id = getattr(user_msg, "model_id", None)
-        if not original_model_id:
-            settings_fallback = get_settings_service().settings
-            if settings_fallback.default_chat_model_id:
-                original_model_id = UUID(settings_fallback.default_chat_model_id)
 
-        if not original_model_id:
+        # default_chat_id acts as the "neutral" seed for routing. We do NOT pass
+        # original_model_id into the synthetic body because _route_request's
+        # Priority 0.5 force-routes to image_gen / web_search based on the
+        # model's capabilities — which would lock the edit into the original
+        # mode. E.g. an image-gen message edited to "what are today top news"
+        # would still hit Nano Banana instead of reaching the intent
+        # classifier. Using a plain chat model as the seed makes the router
+        # classify the edited TEXT and pick the right mode.
+        settings_fallback = get_settings_service().settings
+        default_chat_id: UUID | None = None
+        if settings_fallback.default_chat_model_id:
+            try:
+                default_chat_id = UUID(settings_fallback.default_chat_model_id)
+            except (ValueError, TypeError):
+                default_chat_id = None
+
+        if not original_model_id and not default_chat_id:
             raise HTTPException(
                 status_code=400,
                 detail="Cannot regenerate: no model_id associated with this conversation.",
@@ -2435,7 +2447,7 @@ async def edit_orch_message(
         # them up again; carry the request's reasoning / image-mode flags.
         synthetic_body = OrchChatRequest(
             session_id=user_msg.session_id,
-            model_id=original_model_id,
+            model_id=default_chat_id,
             input_value=body.edited_text,
             files=user_msg.files if user_msg.files else None,
             enable_reasoning=body.enable_reasoning,
@@ -2443,7 +2455,18 @@ async def edit_orch_message(
         )
         routing = await _route_request(session, current_user, synthetic_body)
         mode = routing["mode"]
-        resp_model_id = routing.get("model_id") or original_model_id
+        # Fallback chain for the model that will actually answer:
+        #   routing's explicit model_id → default chat → caller's original.
+        _resp_model_candidate = routing.get("model_id") or default_chat_id or original_model_id
+        if not _resp_model_candidate:
+            # Guarded earlier (we raise if both original and default are
+            # missing), so this is defensive. Re-raise to keep the type
+            # checker happy about resp_model_id being non-None below.
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot regenerate: no model_id resolvable for this edit.",
+            )
+        resp_model_id: UUID = _resp_model_candidate if isinstance(_resp_model_candidate, UUID) else UUID(str(_resp_model_candidate))
         intent = routing.get("intent")
 
         new_response_text = ""
@@ -2476,29 +2499,63 @@ async def edit_orch_message(
         elif mode == "web_search":
             from agentcore.services.mibuddy.web_search_handler import handle_web_search
             from agentcore.services.mibuddy.system_prompts import get_system_identity_prompt
+            # Non-explicit web_search: swap resp_model_id to the configured
+            # WEB_SEARCH_MODEL_NAME registry entry so agent_msg.model_id
+            # reflects the actual model that answered (mirrors the main
+            # streaming flow — needed because the synthetic body uses
+            # default_chat_id as a seed, not the web-search model).
+            settings_svc = get_settings_service().settings
+            if intent == "web_search_explicit":
+                regen_sender_name = await _get_model_display_name(session, resp_model_id)
+            else:
+                regen_sender_name = settings_svc.web_search_model_name or "Web Search"
+                try:
+                    from agentcore.services.model_service_client import fetch_registry_models_async
+                    ws_name = (settings_svc.web_search_model_name or "").strip().lower()
+                    if ws_name:
+                        _all = await fetch_registry_models_async(active_only=True) or []
+                        _match = next(
+                            (m for m in _all if (m.get("display_name") or "").strip().lower() == ws_name),
+                            None,
+                        )
+                        if _match and _match.get("id"):
+                            resp_model_id = UUID(str(_match["id"]))
+                except Exception:  # noqa: BLE001
+                    pass
             result = await handle_web_search(body.edited_text, system_message=get_system_identity_prompt())
             new_response_text = result.get("response_text", "")
             new_model_name = result.get("model_name", "gemini")
-            if intent == "web_search_explicit" and resp_model_id:
-                regen_sender_name = await _get_model_display_name(session, resp_model_id)
-            else:
-                settings_svc = get_settings_service().settings
-                regen_sender_name = settings_svc.web_search_model_name or "Web Search"
 
         elif mode == "image_gen":
             from agentcore.services.mibuddy.image_gen_handler import handle_image_generation
+            # Non-explicit image_gen: swap resp_model_id to the configured
+            # IMAGE_GEN_MODEL_NAME registry entry — otherwise we'd call
+            # handle_image_generation with default_chat_id (a text model).
+            settings_svc = get_settings_service().settings
+            if intent == "image_generation_explicit":
+                regen_sender_name = await _get_model_display_name(session, resp_model_id)
+            else:
+                regen_sender_name = settings_svc.image_gen_model_name or "Image Generator"
+                try:
+                    from agentcore.services.model_service_client import fetch_registry_models_async
+                    ig_name = (settings_svc.image_gen_model_name or "").strip().lower()
+                    if ig_name:
+                        _all = await fetch_registry_models_async(active_only=True) or []
+                        _match = next(
+                            (m for m in _all if (m.get("display_name") or "").strip().lower() == ig_name),
+                            None,
+                        )
+                        if _match and _match.get("id"):
+                            resp_model_id = UUID(str(_match["id"]))
+                except Exception:  # noqa: BLE001
+                    pass
             result = await handle_image_generation(
                 body.edited_text,
-                model_id=str(resp_model_id) if resp_model_id else None,
+                model_id=str(resp_model_id),
                 user_id=str(current_user.id),
             )
             new_response_text = result.get("response_text", "")
             new_model_name = result.get("model_name", "image-generation")
-            if intent == "image_generation_explicit" and resp_model_id:
-                regen_sender_name = await _get_model_display_name(session, resp_model_id)
-            else:
-                settings_svc = get_settings_service().settings
-                regen_sender_name = settings_svc.image_gen_model_name or "Image Generator"
 
         elif mode == "outlook_query":
             from agentcore.services.mibuddy.outlook_agent import outlook_agent_node
