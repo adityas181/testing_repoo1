@@ -700,6 +700,12 @@ export default function AgentOrchestrator() {
   const [showAiModelPicker, setShowAiModelPicker] = useState(false);
   const [showMoreModels, setShowMoreModels] = useState(false);
   const [selectedAiModel, setSelectedAiModel] = useState<string | null>(null);
+  // Header-only model label override (used for routed specialist turns like
+  // web search) without mutating selectedAiModel/request model.
+  const [headerModelOverride, setHeaderModelOverride] = useState<{
+    name: string;
+    icon?: string;
+  } | null>(null);
   const [aiModels, setAiModels] = useState<AiModelOption[]>(FALLBACK_AI_MODELS);
   const [noAgentMode, setNoAgentMode] = useState(false);
   // Addon: SharePoint file picker
@@ -1963,6 +1969,8 @@ export default function AgentOrchestrator() {
     // React state flush timing is tricky). Falls back to the live `input` state.
     const effectiveInput = (typeof overrideText === "string" ? overrideText : input);
     if (!canInteract || (!effectiveInput.trim() && !hasFiles) || isSending || hasPendingHitl) return;
+    // New turn starts: clear prior routed label override.
+    setHeaderModelOverride(null);
     // Hide autocomplete suggestions the moment the user submits, AND cancel any
     // in-flight suggestion fetch so its delayed response can't re-show the dropdown.
     setSuggestions([]);
@@ -2202,6 +2210,19 @@ export default function AgentOrchestrator() {
           // without waiting for the full response.
           if (eventType === "routing") {
             console.warn("[Orch][routing event]", data);
+            const routedMode = String(data?.mode || "").toLowerCase();
+            if (noAgentMode && routedMode === "web_search" && data?.routed_model_name) {
+              const nameStr = String(data.routed_model_name);
+              const byName = aiModels.find(
+                (m) => m.name.toLowerCase() === nameStr.toLowerCase(),
+              );
+              setHeaderModelOverride({
+                name: byName?.name || nameStr,
+                icon: byName?.icon,
+              });
+            } else {
+              setHeaderModelOverride(null);
+            }
             let routedDisplayName: string | null = null;
             if (noAgentMode && data?.routed_model_id) {
               const routedId = String(data.routed_model_id);
@@ -3495,6 +3516,20 @@ export default function AgentOrchestrator() {
                input to switch to an agent — `handleSend` already detects
                that and swaps modes accordingly. */}
           <div ref={aiModelPickerRef} className="relative">
+            {(() => {
+              const selectedModelOption =
+                noAgentMode && selectedAiModel
+                  ? aiModels.find((m) => m.id === selectedAiModel)
+                  : null;
+              const headerDisplayName =
+                noAgentMode
+                  ? (headerModelOverride?.name || selectedModelOption?.name || t("Choose AI Model"))
+                  : t("Choose AI Model");
+              const headerDisplayIcon =
+                noAgentMode
+                  ? (headerModelOverride?.icon || selectedModelOption?.icon)
+                  : undefined;
+              return (
             <button
               disabled={!noAgentMode}
               onClick={() => {
@@ -3515,18 +3550,20 @@ export default function AgentOrchestrator() {
                     : "text-muted-foreground"
               }`}
             >
-              {noAgentMode && selectedAiModel && aiModels.find((m) => m.id === selectedAiModel)?.icon ? (
+              {headerDisplayIcon ? (
                 <img
-                  src={aiModels.find((m) => m.id === selectedAiModel)!.icon}
+                  src={headerDisplayIcon}
                   alt=""
                   className="h-4 w-4 shrink-0 object-contain"
                 />
               ) : (
                 <span className="h-3 w-3 shrink-0 rounded-full bg-muted-foreground/40" />
               )}
-              <span>{noAgentMode && selectedAiModel ? aiModels.find((m) => m.id === selectedAiModel)?.name || t("Choose AI Model") : t("Choose AI Model")}</span>
+              <span>{headerDisplayName}</span>
               <ChevronDown size={14} className="opacity-50" />
             </button>
+              );
+            })()}
 
             {showAiModelPicker && (
               <div className="absolute left-0 top-full z-50 mt-1 min-w-[220px] rounded-xl border border-border bg-popover p-1 shadow-lg">
@@ -3540,6 +3577,7 @@ export default function AgentOrchestrator() {
                     onClick={() => {
                       if (!noAgentMode) return;
                       setSelectedAiModel(model.id);
+                      setHeaderModelOverride(null);
                       setShowAiModelPicker(false);
                     }}
                     className={`flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-sm ${
@@ -3586,6 +3624,7 @@ export default function AgentOrchestrator() {
                           key={model.id}
                           onClick={() => {
                             setSelectedAiModel(model.id);
+                            setHeaderModelOverride(null);
                             setShowAiModelPicker(false);
                             setShowMoreModels(false);
                           }}
