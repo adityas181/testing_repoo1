@@ -425,12 +425,14 @@ function ImageGalleryView({
   onClosePreview,
 }: {
   onBack: () => void;
-  selectedImage: { src: string; name: string } | null;
-  onSelectImage: (img: { src: string; name: string }) => void;
+  selectedImage: { src: string; name: string; shareSrc?: string } | null;
+  onSelectImage: (img: { src: string; name: string; shareSrc?: string }) => void;
   onClosePreview: () => void;
 }) {
   const { t } = useTranslation();
-  const [images, setGalleryImages] = useState<{ id: string; name: string; src: string; createdAt: string }[]>([]);
+  const [images, setGalleryImages] = useState<
+    { id: string; name: string; src: string; shareSrc: string; createdAt: string }[]
+  >([]);
   const [isLoading, setGalleryLoading] = useState(true);
 
   // Fetch AI-generated images from MiBuddy dedicated endpoint
@@ -446,7 +448,10 @@ function ImageGalleryView({
           (data || []).map((img: any, idx: number) => ({
             id: `gen-${idx}`,
             name: img.name || "AI Generated Image",
-            src: img.src,
+            src: img.src || "",
+            // Prefer app-proxied URL for sharing (verified working in current session).
+            // Fall back to direct blob URL when proxy URL is unavailable.
+            shareSrc: img.src || img.share_url || "",
             createdAt: "",
           })),
         );
@@ -498,13 +503,32 @@ function ImageGalleryView({
   // Windows/iOS/Android will open the OS-level share sheet (WhatsApp, Teams,
   // Outlook, Gmail, LinkedIn, etc.). Firefox / older browsers fall back to
   // copying the image URL to the clipboard.
+  const toAbsoluteUrl = (rawUrl: string) => {
+    try {
+      return new URL(rawUrl, window.location.origin).toString();
+    } catch {
+      return rawUrl;
+    }
+  };
+
   const handleShare = async (src: string, name: string) => {
     const title = name || "Generated Image";
+    const shareUrl = toAbsoluteUrl(src);
+
+    // 1) MiBuddy-parity URL share first
     try {
-      // Try sharing the actual image file (better UX — shared as a file attachment
-      // instead of just a link). Works on mobile & modern desktop browsers.
-      // Public blob URLs don't need auth; our /api/... proxied URLs do.
-      const isPublicBlob = /\.blob\.core\.windows\.net\//i.test(src);
+      if ((navigator as any).share) {
+        await (navigator as any).share({ title, url: shareUrl });
+        return;
+      }
+    } catch (err: any) {
+      if (err?.name === "AbortError") return;
+      console.warn("[handleShare] URL share failed, trying file share:", err);
+    }
+
+    // 2) Fallback to file share
+    try {
+      const isPublicBlob = /\.blob\.core\.windows\.net\//i.test(shareUrl);
       const headers: Record<string, string> = {};
       if (!isPublicBlob) {
         const tokenMatch = document.cookie.match(/(?:^|;\s*)access_token_lf=([^;]*)/);
@@ -512,32 +536,25 @@ function ImageGalleryView({
           headers["Authorization"] = `Bearer ${decodeURIComponent(tokenMatch[1])}`;
         }
       }
-      const res = await fetch(src, isPublicBlob ? {} : { headers, credentials: "include" });
+      const res = await fetch(shareUrl, isPublicBlob ? {} : { headers, credentials: "include" });
       if (res.ok) {
         const blob = await res.blob();
         const file = new File([blob], name || `image-${Date.now()}.png`, {
           type: blob.type || "image/png",
         });
-        if ((navigator as any).canShare?.({ files: [file] })) {
+        if ((navigator as any).share && (navigator as any).canShare?.({ files: [file] })) {
           await (navigator as any).share({ title, files: [file] });
           return;
         }
       }
-    } catch (err) {
-      console.warn("[handleShare] File share failed, falling back to URL:", err);
+    } catch (err: any) {
+      if (err?.name === "AbortError") return;
+      console.warn("[handleShare] File share failed, falling back to clipboard:", err);
     }
-    // Fallback 1: share the URL (still triggers OS share sheet on supported browsers)
+
+    // 3) Final fallback: copy share URL
     try {
-      if ((navigator as any).share) {
-        await (navigator as any).share({ title, url: src });
-        return;
-      }
-    } catch (err) {
-      console.warn("[handleShare] URL share failed, falling back to clipboard:", err);
-    }
-    // Fallback 2: copy URL to clipboard (browsers without Web Share API)
-    try {
-      await navigator.clipboard.writeText(src);
+      await navigator.clipboard.writeText(shareUrl);
       useAlertStore.getState().setSuccessData?.({ title: "Image link copied to clipboard" });
     } catch {
       useAlertStore.getState().setErrorData?.({
@@ -546,7 +563,6 @@ function ImageGalleryView({
       });
     }
   };
-
   return (
     <div className="relative flex flex-1 flex-col">
       {/* Header */}
@@ -582,7 +598,7 @@ function ImageGalleryView({
               <div
                 key={img.id}
                 className="group relative cursor-pointer overflow-hidden rounded-xl border border-border bg-muted/30 transition-shadow hover:shadow-lg hover:border-primary/50"
-                onClick={() => onSelectImage({ src: img.src, name: img.name })}
+                onClick={() => onSelectImage({ src: img.src, name: img.name, shareSrc: img.shareSrc })}
               >
                 <div className="aspect-square overflow-hidden">
                   <img
@@ -597,7 +613,7 @@ function ImageGalleryView({
                     <span className="max-w-[60%] truncate text-xs font-medium text-white">{img.name}</span>
                     <div className="flex items-center gap-1">
                       <button
-                        onClick={(e) => { e.stopPropagation(); handleShare(img.src, img.name); }}
+                        onClick={(e) => { e.stopPropagation(); handleShare(img.shareSrc, img.name); }}
                         className="rounded-full bg-white/20 p-1.5 text-white backdrop-blur-sm hover:bg-white/40"
                         title="Share"
                       >
@@ -634,7 +650,10 @@ function ImageGalleryView({
             <img src={selectedImage.src} alt={selectedImage.name} className="max-h-[80vh] max-w-[85vw] rounded-lg object-contain" />
             <div className="mt-4 flex items-center gap-4">
               <span className="max-w-xs truncate text-sm text-white/80">{selectedImage.name}</span>
-              <button onClick={() => handleShare(selectedImage.src, selectedImage.name)} className="flex items-center gap-2 rounded-lg bg-white/10 px-4 py-2 text-sm text-white backdrop-blur-sm hover:bg-white/20">
+              <button
+                onClick={() => handleShare(selectedImage.shareSrc || selectedImage.src, selectedImage.name)}
+                className="flex items-center gap-2 rounded-lg bg-white/10 px-4 py-2 text-sm text-white backdrop-blur-sm hover:bg-white/20"
+              >
                 <Share2 size={16} />
                 {t("Share")}
               </button>
@@ -716,7 +735,9 @@ export default function AgentOrchestrator() {
   const [showOutlookOrch, setShowOutlookOrch] = useState(false);
   const { isOutlookConnected: isOutlookOrchConnected, setIsOutlookConnected: setIsOutlookOrchConnected } =
     useOutlookOrchStatus();
-  const [selectedGalleryImage, setSelectedGalleryImage] = useState<{ src: string; name: string } | null>(null);
+  const [selectedGalleryImage, setSelectedGalleryImage] = useState<
+    { src: string; name: string; shareSrc?: string } | null
+  >(null);
   // Addon: Canvas mode
   const [isCanvasEnabled, setIsCanvasEnabled] = useState(false);
   // Addon: Image generation mode (sticky chip — stays until user clicks ×)
