@@ -1019,6 +1019,38 @@ async def _get_model_display_name(session: DbSession, model_id: UUID) -> str:
     return "Model"
 
 
+async def _model_has_capability(session: DbSession, model_id: UUID | None, cap: str) -> bool:
+    """Return True when a registry model has a given capability (e.g. `web_search`).
+
+    Used by the web_search / image_gen dispatch branches to decide whether to
+    swap the response model to the configured specialist. If the user already
+    selected a model that can handle the intent natively (e.g. Gemini 3 Pro
+    with `web_search=true`), keep their selection — otherwise the dropdown
+    would flip to a different model that may be registered with a provider
+    (like `google` using Generative Language API) that can't serve the
+    follow-up general-chat turn in the same session.
+    """
+    if not model_id:
+        return False
+    try:
+        from agentcore.services.database.models.model_registry.model import ModelRegistry
+        from agentcore.services.mibuddy.model_capabilities import detect_capabilities
+
+        row = await session.get(ModelRegistry, model_id)
+        if not row:
+            return False
+        caps = detect_capabilities(
+            row.provider,
+            row.model_name,
+            row.capabilities,
+            getattr(row, "provider_config", None),
+        )
+        return bool(caps.get(cap))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"[ORCH] Capability probe failed for {model_id} / {cap}: {exc}")
+        return False
+
+
 async def _collect_session_doc_filenames(
     session_id: str,
     user_id: UUID | None = None,
@@ -1511,8 +1543,11 @@ async def orch_chat(
             result = await handle_web_search(body.input_value, system_message=get_system_identity_prompt())
             response_text = result["response_text"]
             resp_model_name = result.get("model_name", "gemini")
-            # Use the actual model's display name (user-selected OR WEB_SEARCH_MODEL_NAME)
-            if routing.get("intent") == "web_search_explicit" and resp_model_id:
+            # Keep the user's selected model when it can handle web_search itself
+            # (prevents the dropdown from flipping to a different provider that
+            # may fail on follow-up general-chat turns in the same session).
+            user_model_can_web_search = await _model_has_capability(session, resp_model_id, "web_search")
+            if user_model_can_web_search or (routing.get("intent") == "web_search_explicit" and resp_model_id):
                 sender_name = await _get_model_display_name(session, resp_model_id)
             else:
                 settings_svc = get_settings_service().settings
@@ -1527,8 +1562,9 @@ async def orch_chat(
             )
             response_text = result["response_text"]
             resp_model_name = result.get("model_name", "image-generation")
-            # Use the actual image-gen model's display name (e.g. "Nano Banana")
-            if routing.get("intent") == "image_generation_explicit" and resp_model_id:
+            # Keep the user's selected model when it can generate images itself.
+            user_model_can_image_gen = await _model_has_capability(session, resp_model_id, "image_generation")
+            if user_model_can_image_gen or (routing.get("intent") == "image_generation_explicit" and resp_model_id):
                 sender_name = await _get_model_display_name(session, resp_model_id)
             else:
                 settings_svc = get_settings_service().settings
@@ -1725,9 +1761,13 @@ async def orch_chat_stream(
             settings_svc = get_settings_service()
             sender_name = settings_svc.settings.company_kb_name or "Knowledge Base"
         elif mode == "web_search":
-            # Use the actual model's display name (either the user-selected one, or
-            # the configured WEB_SEARCH_MODEL_NAME that the handler falls back to).
-            if intent == "web_search_explicit" and resp_model_id:
+            # If the user already picked a web-search-capable model (e.g. Gemini
+            # 3 Pro with web_search=true), keep it — don't flip the dropdown to
+            # the WEB_SEARCH_MODEL_NAME specialist. That flip otherwise strands
+            # follow-up general-chat turns on a different provider that may
+            # fail (e.g. google / Generative Language API).
+            user_model_can_web_search = await _model_has_capability(session, resp_model_id, "web_search")
+            if user_model_can_web_search or (intent == "web_search_explicit" and resp_model_id):
                 sender_name = await _get_model_display_name(session, resp_model_id)
             else:
                 settings_svc = get_settings_service().settings
@@ -1745,10 +1785,11 @@ async def orch_chat_stream(
                 except Exception:
                     pass
         elif mode == "image_gen":
-            # Use the actual image-gen model's display name (e.g. "Nano Banana"),
-            # not generic "Image Generator". When intent routed here, show the
-            # configured IMAGE_GEN_MODEL_NAME.
-            if intent == "image_generation_explicit" and resp_model_id:
+            # Same pattern as web_search: honour the user's choice when the
+            # selected model can generate images natively; only swap to the
+            # IMAGE_GEN_MODEL_NAME specialist when it can't.
+            user_model_can_image_gen = await _model_has_capability(session, resp_model_id, "image_generation")
+            if user_model_can_image_gen or (intent == "image_generation_explicit" and resp_model_id):
                 sender_name = await _get_model_display_name(session, resp_model_id)
             else:
                 settings_svc = get_settings_service().settings
