@@ -191,6 +191,12 @@ class EditMessageRequest(BaseModel):
     edited_text: str
     enable_reasoning: bool = False
     image_mode: bool = False
+    # Currently-selected model from the UI dropdown. Carried so the edit
+    # endpoint can seed the router with the user's current choice (same as a
+    # fresh send) — intent classification still drives mode selection. The
+    # edit endpoint deliberately ignores `image_mode` for routing purposes
+    # because the edited text may imply a different intent than the original.
+    model_id: UUID | None = None
 
 
 class EditMessageResponse(BaseModel):
@@ -2422,14 +2428,26 @@ async def edit_orch_message(
 
         # Synthesise a request that mirrors what would have arrived if the user
         # had typed this as a new message. Keep original files so doc_qa picks
-        # them up again; carry the request's reasoning / image-mode flags.
+        # them up again; carry the request's reasoning flag.
+        #
+        # Seed precedence for model_id: caller's current UI selection
+        # (body.model_id) → default chat model → original response's model.
+        # This matches the send flow — user's dropdown choice is the starting
+        # point, and dispatch-side settings override may still swap to a
+        # specialist model (Nano Banana / web search) based on intent.
+        #
+        # image_mode is deliberately FORCED False. Edit text may imply a
+        # different intent than the original (e.g. edit "generate image" →
+        # "what's the news"); respecting the frontend's current image_mode
+        # would short-circuit intent classification via the fast-path,
+        # defeating the re-routing we want on edits.
         synthetic_body = OrchChatRequest(
             session_id=user_msg.session_id,
-            model_id=default_chat_id,
+            model_id=(body.model_id or default_chat_id or original_model_id),
             input_value=body.edited_text,
             files=user_msg.files if user_msg.files else None,
             enable_reasoning=body.enable_reasoning,
-            image_mode=body.image_mode,
+            image_mode=False,
         )
         routing = await _route_request(session, current_user, synthetic_body)
         mode = routing["mode"]

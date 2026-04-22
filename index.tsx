@@ -1,6 +1,9 @@
+
 import { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
-import { Send, Sparkles, ChevronDown, Plus, MessageSquare, PanelLeftClose, PanelLeft, User, Loader2, Trash2, Check, ImagePlus, X, Clock, Search, Image, Archive, ChevronRight, Globe, BookOpen, Headphones, Info, HelpCircle, Mic, AudioLines, FileUp, Paintbrush, Lightbulb, Upload, MoreVertical, Folder, ArrowLeft, File, FileText, Shield, CheckCircle2, SquarePen, Mail, Download, Copy, Pencil, Share2 } from "lucide-react";
+import { Send, Sparkles, ChevronDown, Plus, MessageSquare, User, Loader2, Trash2, Check, ImagePlus, X, Clock, Search, Image, Archive, ChevronRight, Globe, BookOpen, Headphones, Info, HelpCircle, Mic, AudioLines, FileUp, Paintbrush, Lightbulb, Upload, MoreVertical, Folder, ArrowLeft, File as FileIcon, FileText, Shield, CheckCircle2, SquarePen, Mail, Download, Copy, Pencil, Share2, LayoutGrid, Bot, ThumbsUp, ThumbsDown } from "lucide-react";
+import FeedbackPopup from "./FeedbackPopup";
+import { FaChevronLeft, FaChevronRight } from "react-icons/fa";
 import { useTranslation } from "react-i18next";
 import {
   useGetOrchAgents,
@@ -31,6 +34,8 @@ import OutlookOrchConnector, {
 } from "./OutlookOrchConnector";
 import CanvasEditor from "./CanvasEditor";
 import useAlertStore from "@/stores/alertStore";
+import shareTeamsIcon from "@/assets/share_teams.png";
+import outlookIcon from "@/assets/icons8-outlook-48.png";
 import openaiLogo from "@/assets/openai_logo.svg";
 import geminiLogo from "@/assets/gemini_logo.svg";
 import mistralLogo from "@/assets/mistral_logo.svg";
@@ -47,14 +52,10 @@ import nanoBananaLogo from "@/assets/nano_banana_logo.png";
 import dalleLogo from "@/assets/dalle_logo.svg";
 import googleLogo from "@/assets/google_logo.svg";
 import defaultLlmLogo from "@/assets/default_llm_logo.png";
-import notebookLMLogo from "@/assets/notebooklm_logo.svg";
-import translatorLogo from "@/assets/translator_logo.png";
-// `?url` forces vite-plugin-svgr to give us a URL string (instead of a
-// React component) so these icons can be used as CSS `mask-image` via
-// <SidebarMaskIcon>. Without ?url the import resolves to a component
-// and `url(${src})` becomes invalid → masks silently drop → icons look
-// like plain filled squares.
-import imageLibraryLogo from "@/assets/image_library_logo.svg?url";
+import notebookLMLogo from "@/assets/notebooklm.svg";
+import translatorLogo from "@/assets/ai translator.svg";
+import imageLibraryLogo from "@/assets/image_library_logo.svg";
+import do33Logo from "@/assets/DO33M.16.svg";
 import miNewChatIcon from "@/assets/mibuddy_new_chat.svg?url";
 import miSearchIcon from "@/assets/mibuddy_search.svg?url";
 import miChatHistoryIcon from "@/assets/mibuddy_chat_history.svg?url";
@@ -62,14 +63,7 @@ import miArchiveIcon from "@/assets/mibuddy_archive.svg?url";
 import miInformationIcon from "@/assets/mibuddy_information.svg?url";
 import miHelpIcon from "@/assets/mibuddy_help.svg?url";
 
-// Sidebar icon renderer. Uses a plain <img> (same pattern that works for
-// the Applications section icons). The previous CSS-mask approach silently
-// failed because the Vite SVG import pipeline can resolve the default
-// export as a React component instead of a URL string, making
-// `mask-image: url(${src})` invalid and causing the <span> to show as a
-// solid colored rectangle. <img> handles both default-URL and
-// component-as-string cases more forgivingly, and the `invert`/`opacity`
-// filters below keep the icons visually muted in both themes.
+
 function SidebarMaskIcon({ src, className = "h-4 w-4 shrink-0" }: { src: string; className?: string }) {
   return (
     <img
@@ -186,6 +180,18 @@ interface Message {
   // Canvas mode (MiBuddy-style) — if true, agent responses render in the
   // editable CanvasEditor card rather than as a plain MarkdownField.
   canvasEnabled?: boolean;
+  // True when the backend saved this row as sender="agent" (an agent
+  // deployment response). False when it came from direct model chat
+  // (backend sender="model"). Used by UI affordances that should only
+  // apply to one side — e.g. hiding the Teams/Outlook share menu on
+  // agent replies.
+  isAgentResponse?: boolean;
+  // Thumbs up/down feedback (MiBuddy-parity). Present only on assistant
+  // messages the user has rated; cleared when the user un-votes.
+  feedbackRating?: "up" | "down" | null;
+  feedbackReasons?: string[] | null;
+  feedbackComment?: string | null;
+  feedbackAt?: string | null;
 }
 
 interface FilePreview {
@@ -267,10 +273,24 @@ function mapApiMessages(apiMessages: OrchMessageResponse[]): Message[] {
       block.contents?.some((c: any) => c.type === "tool_use"),
     );
 
+    // Backend stores assistant messages with sender="agent" (agent deployments)
+    // or sender="model" (direct model chat). The UI treats both identically —
+    // normalize to "agent" at this boundary so existing sender === "agent"
+    // checks throughout this file don't each need to learn about "model".
+    // `isAgentResponse` preserves the original distinction for the handful
+    // of UI affordances that should only apply to one side (e.g. the
+    // Teams/Outlook share menu, shown only for model replies).
+    const isAgentResponse = m.sender === "agent";
+    const normalizedSender = (m.sender === "model" ? "agent" : m.sender) as
+      | "user"
+      | "agent"
+      | "system";
+
     return {
       id: m.id,
-      sender: m.sender as "user" | "agent" | "system",
-      agentName: m.sender === "agent" ? m.sender_name : undefined,
+      sender: normalizedSender,
+      agentName: normalizedSender === "agent" ? m.sender_name : undefined,
+      isAgentResponse: normalizedSender === "agent" ? isAgentResponse : undefined,
       content: m.text,
       timestamp: m.timestamp
         ? new Date(m.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
@@ -295,6 +315,11 @@ function mapApiMessages(apiMessages: OrchMessageResponse[]): Message[] {
         ? (props.is_deployed_run !== undefined ? !!props.is_deployed_run : false)
         : undefined,
       reasoningContent: (m as any).reasoning_content || undefined,
+      // Feedback (thumbs up/down) — hydrated from DB so state persists on reload.
+      feedbackRating: ((m as any).feedback_rating ?? null) as "up" | "down" | null,
+      feedbackReasons: ((m as any).feedback_reasons ?? null) as string[] | null,
+      feedbackComment: ((m as any).feedback_comment ?? null) as string | null,
+      feedbackAt: ((m as any).feedback_at ?? null) as string | null,
     };
   });
 }
@@ -641,6 +666,11 @@ export default function AgentOrchestrator() {
   // Addon UI state
   const [showPlusMenu, setShowPlusMenu] = useState(false);
   const [plusMenuPos, setPlusMenuPos] = useState<{ bottom: number; left: number }>({ bottom: 0, left: 0 });
+  const [showAppsPopover, setShowAppsPopover] = useState(false);
+  const [appsPopoverPos, setAppsPopoverPos] = useState<{ top: number; left: number }>({ top: 0, left: 0 });
+  const appsPopoverRef = useRef<HTMLDivElement>(null);
+  const [showAgentsPopover, setShowAgentsPopover] = useState(false);
+  const [agentsPopoverPos, setAgentsPopoverPos] = useState<{ top: number; left: number }>({ top: 0, left: 0 });
   const [cotReasoning, setCotReasoning] = useState(false);
   const [showChatHistoryExpand, setShowChatHistoryExpand] = useState(false);
   const [showArchiveChatExpand, setShowArchiveChatExpand] = useState(false);
@@ -679,9 +709,134 @@ export default function AgentOrchestrator() {
   // Addon: Per-message export menu (msg.id) and copy feedback
   const [exportMenuOpenId, setExportMenuOpenId] = useState<string | null>(null);
   const [copiedMsgId, setCopiedMsgId] = useState<string | null>(null);
+  // Addon: Per-message share/more-options menu
+  const [shareMenuOpenId, setShareMenuOpenId] = useState<string | null>(null);
   // Inline prompt editing (user messages)
   const [editingMsgId, setEditingMsgId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState<string>("");
+  // Feedback popup (thumbs up/down) — opens when the user picks a rating or
+  // switches from one to the other. Null while no popup is active.
+  const [feedbackPopup, setFeedbackPopup] = useState<{
+    messageId: string;
+    mode: "up" | "down";
+    initialReasons: string[];
+    initialComment: string;
+  } | null>(null);
+
+  // ------------------------------------------------------------------
+  // Thumbs up/down feedback handlers (MiBuddy-parity)
+  //  1. First vote on a message         → opens popup, POST on submit
+  //  2. Clicking the opposite thumb     → opens popup for the new rating,
+  //                                       POST overwrites the same DB row
+  //  3. Clicking the active thumb again → DELETE endpoint clears the row
+  //  4. Double-click Submit in popup    → disabled while in-flight (see popup)
+  // ------------------------------------------------------------------
+  const feedbackAuthHeaders = (): Record<string, string> => {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    const tokenMatch = document.cookie.match(/(?:^|;\s*)access_token_ag=([^;]*)/);
+    if (tokenMatch?.[1]) headers["Authorization"] = `Bearer ${decodeURIComponent(tokenMatch[1])}`;
+    return headers;
+  };
+
+  const handleRemoveFeedback = async (messageId: string): Promise<void> => {
+    const previous = messages.find((m) => m.id === messageId);
+    // Optimistic clear.
+    setMessages((prev) => prev.map((m) => (
+      m.id === messageId
+        ? { ...m, feedbackRating: null, feedbackReasons: null, feedbackComment: null, feedbackAt: null }
+        : m
+    )));
+
+    try {
+      const res = await fetch(
+        `${getURL("ORCHESTRATOR")}/messages/${encodeURIComponent(messageId)}/feedback`,
+        { method: "DELETE", headers: feedbackAuthHeaders(), credentials: "include" },
+      );
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    } catch (err) {
+      console.error("[handleRemoveFeedback] failed:", err);
+      if (previous) {
+        setMessages((prev) => prev.map((m) => (m.id === messageId ? previous : m)));
+      }
+      useAlertStore.getState().setErrorData?.({
+        title: "Could not remove rating",
+        list: ["Please try again."],
+      });
+    }
+  };
+
+  const handleThumbClick = (msg: Message, rating: "up" | "down") => {
+    if (msg.sender !== "agent") return;
+    // Case 3: clicking the already-active thumb → un-vote → DELETE.
+    if (msg.feedbackRating === rating) {
+      void handleRemoveFeedback(msg.id);
+      return;
+    }
+    // Cases 1 & 2: first vote or switch → open popup, pre-fill if switching.
+    setFeedbackPopup({
+      messageId: msg.id,
+      mode: rating,
+      initialReasons: msg.feedbackRating === rating ? (msg.feedbackReasons ?? []) : [],
+      initialComment: msg.feedbackRating === rating ? (msg.feedbackComment ?? "") : "",
+    });
+  };
+
+  const handleSubmitFeedback = async (reasons: string[], comment: string): Promise<void> => {
+    if (!feedbackPopup) return;
+    const { messageId, mode } = feedbackPopup;
+
+    // Optimistic update — UI fills the thumb immediately.
+    const previous = messages.find((m) => m.id === messageId);
+    setMessages((prev) => prev.map((m) => (
+      m.id === messageId
+        ? {
+            ...m,
+            feedbackRating: mode,
+            feedbackReasons: reasons.length ? reasons : null,
+            feedbackComment: comment || null,
+            feedbackAt: new Date().toISOString(),
+          }
+        : m
+    )));
+
+    try {
+      const res = await fetch(
+        `${getURL("ORCHESTRATOR")}/messages/${encodeURIComponent(messageId)}/feedback`,
+        {
+          method: "POST",
+          headers: feedbackAuthHeaders(),
+          credentials: "include",
+          body: JSON.stringify({ rating: mode, reasons, comment: comment || null }),
+        },
+      );
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      // Reconcile with server-returned state (authoritative).
+      setMessages((prev) => prev.map((m) => (
+        m.id === messageId
+          ? {
+              ...m,
+              feedbackRating: (data.feedback_rating ?? null) as "up" | "down" | null,
+              feedbackReasons: data.feedback_reasons ?? null,
+              feedbackComment: data.feedback_comment ?? null,
+              feedbackAt: data.feedback_at ?? null,
+            }
+          : m
+      )));
+      setFeedbackPopup(null);
+    } catch (err) {
+      console.error("[handleSubmitFeedback] failed:", err);
+      if (previous) {
+        setMessages((prev) => prev.map((m) => (m.id === messageId ? previous : m)));
+      }
+      useAlertStore.getState().setErrorData?.({
+        title: "Could not save feedback",
+        list: ["Please try again."],
+      });
+      throw err; // let FeedbackPopup re-enable Submit
+    }
+  };
+
   // Ref holder so handleSaveEdit can call handleSend without creating a circular
   // useCallback dependency chain. Accepts an optional override text for edit-and-send.
   const handleSendRef = useRef<((overrideText?: string) => void) | null>(null);
@@ -704,6 +859,24 @@ export default function AgentOrchestrator() {
   // are not connected to anything.
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const TEXTAREA_MAX_HEIGHT = 124;
+
+  // Auto-grow textarea to fit content (MiBuddy-style), up to max height
+  const autoGrowTextarea = useCallback(() => {
+    const ta = textareaRef.current;
+    if (!ta) return;
+    ta.style.height = "auto";
+    const sh = ta.scrollHeight;
+    if (sh <= TEXTAREA_MAX_HEIGHT) {
+      ta.style.overflowY = "hidden";
+      ta.style.height = `${sh}px`;
+    } else {
+      ta.style.overflowY = "auto";
+      ta.style.height = `${TEXTAREA_MAX_HEIGHT}px`;
+    }
+  }, []);
+
+  useEffect(() => { autoGrowTextarea(); }, [input, autoGrowTextarea]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const modelPickerRef = useRef<HTMLDivElement>(null);
@@ -781,7 +954,7 @@ export default function AgentOrchestrator() {
     }
   };
 
-  const MAX_FILES = 5;
+  const MAX_FILES = 10;
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
@@ -1096,6 +1269,25 @@ export default function AgentOrchestrator() {
     return () => { cancelled = true; };
   }, []);
 
+  // Default state on page open: No Agent selected, MiBuddy AI pre-selected in
+  // the model dropdown. MUST run exactly once — without the ref guard, picking
+  // an agent (which sets selectedAiModel=null) would re-trigger this effect and
+  // snap the UI back to MiBuddy AI, blocking agent selection entirely.
+  // Priority for model: explicit MiBuddy AI entry → is_default flag → first model.
+  const didDefaultSelectRef = useRef(false);
+  useEffect(() => {
+    if (didDefaultSelectRef.current) return;
+    if (aiModels.length === 0) return;
+    didDefaultSelectRef.current = true;
+    const mibuddy = aiModels.find((m) => /mibuddy[\s_-]?ai/i.test(m.name));
+    const defaultModel = mibuddy || aiModels.find((m) => m.is_default) || aiModels[0];
+    if (defaultModel) {
+      setSelectedAiModel(defaultModel.id);
+      setNoAgentMode(true);
+      setSelectedModelId("");
+    }
+  }, [aiModels]);
+
   // Keep HITL status in sync when decisions happen on HITL Approvals page.
   // This lets orchestrator chat hide the pending banner and show final status
   // (Approved / Rejected / etc.) without requiring a full page reload.
@@ -1234,6 +1426,12 @@ export default function AgentOrchestrator() {
       if (!(e.target as Element)?.closest?.("[data-plus-menu]")) {
         setShowPlusMenu(false);
       }
+      if (!(e.target as Element)?.closest?.("[data-apps-popover]")) {
+        setShowAppsPopover(false);
+      }
+      if (!(e.target as Element)?.closest?.("[data-agents-popover]")) {
+        setShowAgentsPopover(false);
+      }
       if (aiModelPickerRef.current && !aiModelPickerRef.current.contains(e.target as Node)) {
         setShowAiModelPicker(false);
         setShowMoreModels(false);
@@ -1245,6 +1443,10 @@ export default function AgentOrchestrator() {
       // Close per-message export menu when clicking outside
       if (!(e.target as Element)?.closest?.("[data-export-menu]")) {
         setExportMenuOpenId(null);
+      }
+      // Close per-message share menu when clicking outside
+      if (!(e.target as Element)?.closest?.("[data-share-menu]")) {
+        setShareMenuOpenId(null);
       }
       // Close suggestions when clicking outside input area
       if (!(e.target as Element)?.closest?.("textarea")) {
@@ -1578,6 +1780,54 @@ export default function AgentOrchestrator() {
     setTimeout(() => setCopiedMsgId((id) => (id === msgId ? null : id)), 1500);
   }, []);
 
+  // Strip markdown for email body
+  const stripMarkdownForEmail = useCallback((text: string): string => {
+    return text
+      .replace(/\*{1,3}(.*?)\*{1,3}/g, "$1")
+      .replace(/^#{1,6}\s+/gm, "")
+      .replace(/^\s*[-*+]\s+/gm, "• ")
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+      .replace(/`+([^`]+)`+/g, "$1")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+  }, []);
+
+  // Share on MS Teams
+  const handleShareTeams = useCallback((text: string) => {
+    if (!text) return;
+    const encodedText = encodeURIComponent(text);
+    const deepLink = `https://teams.microsoft.com/l/chat/0/0?users=&topicName=Topic&message=${encodedText}`;
+
+    navigator.clipboard.writeText(text).then(() => {
+      useAlertStore.getState().setSuccessData?.({ title: "Content copied to clipboard" });
+      setTimeout(() => {
+        useAlertStore.getState().setNoticeData?.({ title: "Opening Teams..." });
+        setTimeout(() => {
+          window.open(deepLink, "_blank");
+        }, 300);
+      }, 1000);
+    }).catch((err) => {
+      console.error("Error copying text: ", err);
+    });
+    setShareMenuOpenId(null);
+  }, []);
+
+  // Draft in Outlook
+  const handleOutlookDraft = useCallback((text: string) => {
+    if (!text) return;
+    const body = stripMarkdownForEmail(text);
+    const subject = "Shared from MiBuddy";
+    try {
+      const mailtoLink = `mailto:?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+      window.open(mailtoLink);
+    } catch {
+      navigator.clipboard.writeText(body).then(() => {
+        useAlertStore.getState().setSuccessData?.({ title: "Email body copied to clipboard. Paste it into a new Outlook email." });
+      });
+    }
+    setShareMenuOpenId(null);
+  }, [stripMarkdownForEmail]);
+
   // Start inline editing a user message
   const handleStartEdit = useCallback((msgId: string, currentText: string) => {
     setEditingMsgId(msgId);
@@ -1644,7 +1894,10 @@ export default function AgentOrchestrator() {
           body: JSON.stringify({
             edited_text: text,
             enable_reasoning: cotReasoning,
-            image_mode: imageMode,
+            // image_mode is intentionally NOT sent — backend forces
+            // image_mode=false on edits so intent classification drives the
+            // mode, regardless of the original message's routing.
+            model_id: (noAgentMode && selectedAiModel) ? selectedAiModel : undefined,
           }),
         },
       );
@@ -1799,6 +2052,10 @@ export default function AgentOrchestrator() {
           content: "",  // empty = "Thinking..." state
           timestamp: timeNow(),
           canvasEnabled: isCanvasEnabled || undefined,
+          // Mirror the backend's sender="model" vs "agent" distinction so UI
+          // affordances (e.g. Teams/Outlook share menu) are hidden immediately
+          // for model replies instead of flashing until the post-send refetch.
+          isAgentResponse: !noAgentMode,
         },
       ]);
       setInput("");
@@ -2313,11 +2570,11 @@ export default function AgentOrchestrator() {
 
   /* ---- group chat history by date ---- */
   const activeSessions = useMemo(
-    () => (apiSessions || []).filter((s) => !s.is_archived),
+    () => (apiSessions || []).filter((s) => !s.is_archived).slice(0, 20),
     [apiSessions],
   );
   const archivedSessions = useMemo(
-    () => (apiSessions || []).filter((s) => s.is_archived),
+    () => (apiSessions || []).filter((s) => s.is_archived).slice(0, 20),
     [apiSessions],
   );
 
@@ -2350,26 +2607,36 @@ export default function AgentOrchestrator() {
     () => groupSessionsByDate(filteredArchivedSessions, t),
     [filteredArchivedSessions, t],
   );
+  const visibleAgents = useMemo(() => agents.slice(0, 5), [agents]);
+  const hiddenAgentsCount = Math.max(0, agents.length - visibleAgents.length);
 
   /* ------------------ RENDER ------------------ */
 
   return (
-    <div className="flex h-screen w-full overflow-hidden bg-background text-foreground">
+    <div className="relative flex h-screen w-full overflow-hidden bg-background text-foreground">
       {/* ================ SIDEBAR ================ */}
       <div
-        className={`flex flex-col overflow-hidden border-r border-border bg-muted transition-all duration-200 ${
-          sidebarOpen ? "w-64 min-w-[16rem]" : "w-0 min-w-0"
+        className={`relative z-30 flex flex-col overflow-visible border-r border-border bg-muted transition-all duration-200 ${
+          sidebarOpen ? "w-64 min-w-[16rem]" : "w-14 min-w-[3.5rem]"
         }`}
       >
-        {/* Sidebar Header */}
-        <div className="flex items-center justify-between p-3">
+        {/* Second sidebar collapse toggle (fixed seam anchor) */}
+        <div className="absolute right-[-12px] top-[56px] z-[260] -translate-y-1/2">
           <button
-            onClick={() => setSidebarOpen(false)}
-            className="flex items-center rounded-md p-1.5 text-muted-foreground hover:bg-accent"
+            onClick={() => setSidebarOpen(!sidebarOpen)}
+            className="pointer-events-auto flex h-6 w-6 items-center justify-center rounded-full border border-gray-200 bg-white text-gray-700 shadow-md hover:bg-gray-100"
+            title={sidebarOpen ? t("Collapse sidebar") : t("Expand sidebar")}
           >
-            <PanelLeftClose size={18} />
+            {sidebarOpen ? (
+              <FaChevronLeft className="h-3.5 w-3.5" />
+            ) : (
+              <FaChevronRight className="h-3.5 w-3.5" />
+            )}
           </button>
         </div>
+
+        {/* Sidebar Header */}
+        <div className="flex h-12 items-center px-3" />
 
         {/* ---- Single scrollable region containing nav + apps + info + agents.
               Without this, expanding "Chat history" pushed the Applications
@@ -2384,17 +2651,15 @@ export default function AgentOrchestrator() {
           {/* New chat */}
           <button
             onClick={() => {
-              // Close any inline panel (NotebookLM / Image gallery) first,
-              // otherwise the chat view stays hidden behind them and the
-              // click silently does nothing from the user's POV.
               setShowNotebookLM(false);
               setShowImageGallery(false);
               handleNewChat();
             }}
-            className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
+            className={`flex w-full items-center rounded-lg py-2 text-sm text-foreground hover:bg-accent ${sidebarOpen ? "gap-3 px-3" : "justify-center px-0"}`}
+            title={t("New chat")}
           >
             <SidebarMaskIcon src={miNewChatIcon} />
-            <span>{t("New chat")}</span>
+            {sidebarOpen && <span>{t("New chat")}</span>}
           </button>
 
           {/* Search chats */}
@@ -2403,85 +2668,14 @@ export default function AgentOrchestrator() {
               setShowSearchInput(true);
               setSidebarSearchQuery("");
             }}
-            className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
+            className={`flex w-full items-center rounded-lg py-2 text-sm text-foreground hover:bg-accent ${sidebarOpen ? "gap-3 px-3" : "justify-center px-0"}`}
+            title={t("Search chats")}
           >
             <SidebarMaskIcon src={miSearchIcon} />
-            <span>{t("Search chats")}</span>
+            {sidebarOpen && <span>{t("Search chats")}</span>}
           </button>
 
-          {/* Search overlay */}
-          {showSearchInput && (
-            <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/30 pt-[10vh]" onClick={() => { setShowSearchInput(false); setSidebarSearchQuery(""); }}>
-              <div
-                className="w-full max-w-lg rounded-xl bg-background shadow-2xl border border-border"
-                onClick={(e) => e.stopPropagation()}
-              >
-                {/* Search input header */}
-                <div className="flex items-center gap-2 border-b border-border px-4 py-3">
-                  <input
-                    type="text"
-                    value={sidebarSearchQuery}
-                    onChange={(e) => setSidebarSearchQuery(e.target.value)}
-                    placeholder={t("Search chats...")}
-                    className="flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground focus:outline-none"
-                    autoFocus
-                  />
-                  <button
-                    onClick={() => { setShowSearchInput(false); setSidebarSearchQuery(""); }}
-                    className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
-                  >
-                    <X size={16} />
-                  </button>
-                </div>
-
-                {/* New chat button */}
-                <button
-                  onClick={() => { setShowSearchInput(false); setSidebarSearchQuery(""); handleNewChat(); }}
-                  className="flex w-full items-center gap-3 px-4 py-3 text-sm font-medium text-foreground hover:bg-accent"
-                >
-                  <SquarePen size={16} className="shrink-0 text-muted-foreground" />
-                  <span>{t("New-chat")}</span>
-                </button>
-
-                {/* Recent sessions list */}
-                <div className="max-h-[50vh] overflow-y-auto px-2 pb-3" style={{ scrollbarWidth: "thin" }}>
-                  {Object.entries(grouped).length === 0 && sidebarSearchQuery.trim() ? (
-                    <div className="px-4 py-6 text-center text-sm text-muted-foreground">
-                      {t("No matching chats")}
-                    </div>
-                  ) : (
-                    Object.entries(grouped).map(([date, chats]) => (
-                      <div key={date} className="mb-1">
-                        <div className="px-3 pb-1 pt-3 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-                          {date}
-                        </div>
-                        {chats.map((chat) => (
-                          <button
-                            key={chat.session_id}
-                            onClick={() => { setShowSearchInput(false); setSidebarSearchQuery(""); handleSelectSession(chat.session_id); }}
-                            className={`flex w-full items-start gap-3 rounded-lg px-3 py-2.5 text-left text-sm hover:bg-accent ${
-                              currentSessionId === chat.session_id ? "bg-accent" : ""
-                            }`}
-                          >
-                            <MessageSquare size={14} className="mt-0.5 shrink-0 opacity-50" />
-                            <div className="min-w-0 flex-1">
-                              <div className="truncate font-medium text-foreground">
-                                {chat.active_agent_name || t("Chat")}
-                                {chat.active_agent_name ? ` - ${chat.active_agent_name}` : ""}
-                              </div>
-                              <div className="mt-0.5 truncate text-xs text-muted-foreground">
-                                {sessionDisplayName(chat)}
-                              </div>
-                            </div>
-                          </button>
-                        ))}
-                      </div>
-                    ))
-                  )}
-                </div>
-              </div>
-            </div>
-          )}
+          {/* Search overlay moved to top-level so backdrop covers sidebar */}
 
           {/* Image — toggles gallery view in main area */}
           <button
@@ -2489,23 +2683,25 @@ export default function AgentOrchestrator() {
               setShowImageGallery(!showImageGallery);
               setShowNotebookLM(false);
             }}
-            className={`flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent ${showImageGallery ? "bg-accent" : ""}`}
+            className={`flex w-full items-center rounded-lg py-2 text-sm text-foreground hover:bg-accent ${showImageGallery ? "bg-accent" : ""} ${sidebarOpen ? "gap-3 px-3" : "justify-center px-0"}`}
+            title={t("Image")}
           >
             <SidebarMaskIcon src={imageLibraryLogo} />
-            <span>{t("Image")}</span>
+            {sidebarOpen && <span>{t("Image")}</span>}
           </button>
 
           {/* Chat history (collapsible) — contains all conversations */}
           <button
-            onClick={() => setShowChatHistoryExpand(!showChatHistoryExpand)}
-            className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
+            onClick={() => { if (sidebarOpen) setShowChatHistoryExpand(!showChatHistoryExpand); else setSidebarOpen(true); }}
+            className={`flex w-full items-center rounded-lg py-2 text-sm text-foreground hover:bg-accent ${sidebarOpen ? "gap-3 px-3" : "justify-center px-0"}`}
+            title={t("Chat history")}
           >
             <SidebarMaskIcon src={miChatHistoryIcon} />
-            <span className="flex-1 text-left">{t("Chat history")}</span>
-            <ChevronRight size={14} className={`text-muted-foreground transition-transform ${showChatHistoryExpand ? "rotate-90" : ""}`} />
+            {sidebarOpen && <span className="flex-1 text-left">{t("Chat history")}</span>}
+            {sidebarOpen && <ChevronRight size={14} className={`text-muted-foreground transition-transform ${showChatHistoryExpand ? "rotate-90" : ""}`} />}
           </button>
-          {showChatHistoryExpand && (
-            <div className="ml-4 border-l border-border pl-1">
+          {sidebarOpen && showChatHistoryExpand && (
+            <div className="ml-4 max-h-[9rem] overflow-y-auto border-l border-border pl-1">
               {Object.entries(grouped).map(([date, chats]) => (
                 <div key={date} className="mb-2">
                   <div className="px-3 pb-1 pt-2 text-xxs font-semibold uppercase tracking-wide text-muted-foreground">
@@ -2585,15 +2781,16 @@ export default function AgentOrchestrator() {
 
           {/* Archive Chat (collapsible) */}
           <button
-            onClick={() => setShowArchiveChatExpand(!showArchiveChatExpand)}
-            className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
+            onClick={() => { if (sidebarOpen) setShowArchiveChatExpand(!showArchiveChatExpand); else setSidebarOpen(true); }}
+            className={`flex w-full items-center rounded-lg py-2 text-sm text-foreground hover:bg-accent ${sidebarOpen ? "gap-3 px-3" : "justify-center px-0"}`}
+            title={t("Archive Chat")}
           >
             <SidebarMaskIcon src={miArchiveIcon} />
-            <span className="flex-1 text-left">{t("Archive Chat")}</span>
-            <ChevronRight size={14} className={`text-muted-foreground transition-transform ${showArchiveChatExpand ? "rotate-90" : ""}`} />
+            {sidebarOpen && <span className="flex-1 text-left">{t("Archive Chat")}</span>}
+            {sidebarOpen && <ChevronRight size={14} className={`text-muted-foreground transition-transform ${showArchiveChatExpand ? "rotate-90" : ""}`} />}
           </button>
-          {showArchiveChatExpand && (
-            <div className="ml-4 border-l border-border pl-1">
+          {sidebarOpen && showArchiveChatExpand && (
+            <div className="ml-4 max-h-[9rem] overflow-y-auto border-l border-border pl-1">
               {archivedSessions.length === 0 ? (
                 <div className="px-3 py-4 text-center text-xs text-muted-foreground">
                   {t("No archived chats")}
@@ -2648,36 +2845,53 @@ export default function AgentOrchestrator() {
 
         {/* ---- Addon: Applications Section ---- */}
         <div className="border-t border-border px-2 pb-2 pt-2">
-          <div className="px-3 pb-1 text-xxs font-semibold uppercase tracking-wide text-muted-foreground">
-            {t("Applications")}
-          </div>
-          <div className="flex flex-col gap-0.5">
-            <button
-              onClick={() => window.open("https://translator.motherson.com", "_blank")}
-              className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
-            >
-              <img src={translatorLogo} alt="" className="h-4 w-4 shrink-0 object-contain" />
-              <span>{t("AI Translator")}</span>
-            </button>
-            <button
-              onClick={() => window.open("https://genai.motherson.com/do33", "_blank")}
-              className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
-            >
-              <img src={imageLibraryLogo} alt="" className="h-4 w-4 shrink-0 object-contain" />
-              <span>{t("DO33")}</span>
-            </button>
-            <button
-              onClick={() => {
-                setShowNotebookLM(true);
-                setShowImageGallery(false);
-              }}
-              className={`flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent ${showNotebookLM ? "bg-accent" : ""}`}
-            >
-              <img src={notebookLMLogo} alt="" className="h-4 w-4 shrink-0 object-contain" />
-              <span>{t("NotebookLM")}</span>
-            </button>
-
-          </div>
+          {sidebarOpen ? (
+            <>
+              <div className="px-3 pb-1 text-xxs font-semibold uppercase tracking-wide text-muted-foreground">
+                {t("Applications")}
+              </div>
+              <div className="flex flex-col gap-0.5">
+                <button
+                  onClick={() => window.open("https://translator.motherson.com", "_blank")}
+                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
+                >
+                  <img src={translatorLogo} alt="" className="h-4 w-4 shrink-0 object-contain" />
+                  <span>{t("AI Translator")}</span>
+                </button>
+                <button
+                  onClick={() => window.open("https://genai.motherson.com/do33", "_blank")}
+                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
+                >
+                  <img src={do33Logo} alt="" className="h-4 w-4 shrink-0 object-contain" />
+                  <span>{t("DO33")}</span>
+                </button>
+                <button
+                  onClick={() => {
+                    setShowNotebookLM(true);
+                    setShowImageGallery(false);
+                  }}
+                  className={`flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent ${showNotebookLM ? "bg-accent" : ""}`}
+                >
+                  <img src={notebookLMLogo} alt="" className="h-4 w-4 shrink-0 object-contain" />
+                  <span>{t("NotebookLM")}</span>
+                </button>
+              </div>
+            </>
+          ) : (
+            <div data-apps-popover className="relative flex justify-center">
+              <button
+                onClick={(e) => {
+                  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                  setAppsPopoverPos({ top: rect.top, left: rect.right + 8 });
+                  setShowAppsPopover(!showAppsPopover);
+                }}
+                className="flex items-center justify-center rounded-lg p-2 text-muted-foreground hover:bg-accent hover:text-foreground"
+                title={t("Applications")}
+              >
+                <LayoutGrid size={18} />
+              </button>
+            </div>
+          )}
         </div>
 
         {/* ---- Addon: Information & Help (wired same as MiBuddy) ----
@@ -2692,10 +2906,11 @@ export default function AgentOrchestrator() {
                 "_blank",
               )
             }
-            className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
+            className={`flex w-full items-center rounded-lg py-2 text-sm text-foreground hover:bg-accent ${sidebarOpen ? "gap-3 px-3" : "justify-center px-0"}`}
+            title={t("Information")}
           >
             <SidebarMaskIcon src={miInformationIcon} />
-            <span>{t("Information")}</span>
+            {sidebarOpen && <span>{t("Information")}</span>}
           </button>
           <button
             onClick={() => {
@@ -2704,22 +2919,45 @@ export default function AgentOrchestrator() {
               );
               window.location.href = `mailto:support.mtsl@motherson.com,MiBuddy.Feedback@motherson.com?subject=${subject}`;
             }}
-            className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
+            className={`flex w-full items-center rounded-lg py-2 text-sm text-foreground hover:bg-accent ${sidebarOpen ? "gap-3 px-3" : "justify-center px-0"}`}
+            title={t("Help")}
           >
             <SidebarMaskIcon src={miHelpIcon} />
-            <span>{t("Help")}</span>
+            {sidebarOpen && <span>{t("Help")}</span>}
           </button>
+          {!sidebarOpen && (
+            <div data-agents-popover className="relative mt-0.5 flex justify-center">
+              <button
+                onClick={(e) => {
+                  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                  const popoverHeight = 320;
+                  const margin = 12;
+                  const top = Math.max(
+                    margin,
+                    Math.min(rect.top, window.innerHeight - popoverHeight - margin),
+                  );
+                  setAgentsPopoverPos({ top, left: rect.right + 8 });
+                  setShowAgentsPopover(!showAgentsPopover);
+                }}
+                className="flex items-center justify-center rounded-lg p-2 text-muted-foreground hover:bg-accent hover:text-foreground"
+                title={t("Agents")}
+              >
+                <Bot size={18} />
+              </button>
+            </div>
+          )}
         </div>
 
         {/* Agents Panel — no internal scroll; participates in the single
             sidebar scroll defined by the parent wrapper. */}
+        {sidebarOpen && (
         <div className="flex shrink-0 flex-col border-t border-border">
           <div className="shrink-0 px-4 pb-2 pt-3 text-xxs font-semibold uppercase tracking-wide text-muted-foreground">
             {t("Agents")}
           </div>
           <div className="px-2 pb-2">
             <div className="flex flex-col gap-0.5">
-              {agents.map((agent) => (
+              {visibleAgents.map((agent) => (
                 <button
                   key={agent.id}
                   onClick={() => {
@@ -2741,11 +2979,96 @@ export default function AgentOrchestrator() {
                   </span>
                 </button>
               ))}
+              {hiddenAgentsCount > 0 && (
+                <button
+                  data-agents-popover
+                  onClick={(e) => {
+                    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                    const popoverHeight = 320;
+                    const margin = 12;
+                    const top = Math.max(
+                      margin,
+                      Math.min(rect.top - 8, window.innerHeight - popoverHeight - margin),
+                    );
+                    setAgentsPopoverPos({ top, left: rect.right + 8 });
+                    setShowAgentsPopover(true);
+                  }}
+                  className="mt-0.5 flex w-full items-center justify-between rounded-lg px-2 py-2 text-left text-[13px] text-muted-foreground hover:bg-accent hover:text-foreground"
+                  title={t("Show more agents")}
+                >
+                  <span>{t("More")}</span>
+                  <span className="text-xxs">+{hiddenAgentsCount}</span>
+                </button>
+              )}
             </div>
           </div>
         </div>
+        )}
         </div>
       </div>
+
+      {/* ---- Apps popover (collapsed sidebar) ---- */}
+      {showAppsPopover && (
+        <div
+          data-apps-popover
+          className="fixed z-[100] min-w-[200px] rounded-xl border border-border bg-popover p-1.5 shadow-lg"
+          style={{ top: appsPopoverPos.top, left: appsPopoverPos.left }}
+        >
+          <button
+            onClick={() => { setShowAppsPopover(false); window.open("https://translator.motherson.com", "_blank"); }}
+            className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
+          >
+            <img src={translatorLogo} alt="" className="h-5 w-5 shrink-0 object-contain" />
+            <span>{t("AI Translator")}</span>
+          </button>
+          <button
+            onClick={() => { setShowAppsPopover(false); window.open("https://genai.motherson.com/do33", "_blank"); }}
+            className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
+          >
+            <img src={do33Logo} alt="" className="h-5 w-5 shrink-0 object-contain" />
+            <span>{t("DO33")}</span>
+          </button>
+          <button
+            onClick={() => { setShowAppsPopover(false); setShowNotebookLM(true); setShowImageGallery(false); }}
+            className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent ${showNotebookLM ? "bg-accent" : ""}`}
+          >
+            <img src={notebookLMLogo} alt="" className="h-5 w-5 shrink-0 object-contain" />
+            <span>{t("NotebookLM")}</span>
+          </button>
+        </div>
+      )}
+      {showAgentsPopover && (
+        <div
+          data-agents-popover
+          className="fixed z-[100] min-w-[220px] rounded-xl border border-border bg-popover p-1.5 shadow-lg"
+          style={{ top: agentsPopoverPos.top, left: agentsPopoverPos.left }}
+        >
+          <div className="px-2 py-1 text-xxs font-semibold uppercase tracking-wide text-muted-foreground">
+            {t("Agents")}
+          </div>
+          <div className="max-h-[260px] overflow-y-auto">
+            {agents.map((agent) => (
+              <button
+                key={agent.id}
+                onClick={() => {
+                  setSelectedModelId(agent.id);
+                  setShowModelPicker(false);
+                  setShowAgentsPopover(false);
+                }}
+                className={`flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm text-foreground hover:bg-accent ${
+                  selectedModelId === agent.id ? "bg-accent" : ""
+                }`}
+              >
+                <span
+                  className="h-2 w-2 shrink-0 rounded-full"
+                  style={{ background: agent.online ? agent.color : undefined }}
+                />
+                <span className="min-w-0 truncate">{agent.name}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* ---- Addon: Plus menu dropdown — rendered fixed to escape input overflow ---- */}
       {showPlusMenu && (
@@ -2965,6 +3288,80 @@ export default function AgentOrchestrator() {
         </div>
       )}
 
+      {/* ================ SEARCH OVERLAY ================ */}
+      {showSearchInput && (
+        <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/30 pt-[10vh]" onClick={() => { setShowSearchInput(false); setSidebarSearchQuery(""); }}>
+          <div
+            className="w-full max-w-lg rounded-xl bg-background shadow-2xl border border-border"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Search input header */}
+            <div className="flex items-center gap-2 border-b border-border px-4 py-3">
+              <input
+                type="text"
+                value={sidebarSearchQuery}
+                onChange={(e) => setSidebarSearchQuery(e.target.value)}
+                placeholder={t("Search chats...")}
+                className="flex-1 bg-transparent text-sm text-foreground placeholder:text-muted-foreground focus:outline-none"
+                autoFocus
+              />
+              <button
+                onClick={() => { setShowSearchInput(false); setSidebarSearchQuery(""); }}
+                className="shrink-0 rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            {/* New chat button */}
+            <button
+              onClick={() => { setShowSearchInput(false); setSidebarSearchQuery(""); handleNewChat(); }}
+              className="flex w-full items-center gap-3 px-4 py-3 text-sm font-medium text-foreground hover:bg-accent"
+            >
+              <SquarePen size={16} className="shrink-0 text-muted-foreground" />
+              <span>{t("New-chat")}</span>
+            </button>
+
+            {/* Recent sessions list */}
+            <div className="max-h-[50vh] overflow-y-auto px-2 pb-3" style={{ scrollbarWidth: "thin" }}>
+              {Object.entries(grouped).length === 0 && sidebarSearchQuery.trim() ? (
+                <div className="px-4 py-6 text-center text-sm text-muted-foreground">
+                  {t("No matching chats")}
+                </div>
+              ) : (
+                Object.entries(grouped).map(([date, chats]) => (
+                  <div key={date} className="mb-1">
+                    <div className="px-3 pb-1 pt-3 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                      {date}
+                    </div>
+                    {chats.map((chat) => (
+                      <button
+                        key={chat.session_id}
+                        onClick={() => { setShowSearchInput(false); setSidebarSearchQuery(""); handleSelectSession(chat.session_id); }}
+                        className={`flex w-full items-start gap-3 rounded-lg px-3 py-2.5 text-left text-sm hover:bg-accent ${
+                          currentSessionId === chat.session_id ? "bg-accent" : ""
+                        }`}
+                      >
+                        <MessageSquare size={14} className="mt-0.5 shrink-0 opacity-50" />
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate font-medium text-foreground">
+                            {chat.active_agent_name || t("Chat")}
+                            {chat.active_agent_name ? ` - ${chat.active_agent_name}` : ""}
+                          </div>
+                          <div className="mt-0.5 truncate text-xs text-muted-foreground">
+                            {sessionDisplayName(chat)}
+                          </div>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ================ MAIN AREA ================ */}
       {showNotebookLM ? (
         /* ---- NotebookLM panel (inline, like image gallery) ---- */
@@ -2981,15 +3378,6 @@ export default function AgentOrchestrator() {
       <div className="relative flex flex-1 flex-col">
         {/* Top Bar */}
         <div className="flex h-[52px] shrink-0 items-center gap-2 border-b border-border px-4">
-          {!sidebarOpen && (
-            <button
-              onClick={() => setSidebarOpen(true)}
-              className="flex items-center rounded-md p-1.5 text-muted-foreground hover:bg-accent"
-            >
-              <PanelLeft size={18} />
-            </button>
-          )}
-
           {/* Agent selector */}
           <div ref={modelPickerRef} className="relative">
             <button
@@ -3262,25 +3650,22 @@ export default function AgentOrchestrator() {
                     )
                   : undefined;
               return (
-                <div key={msg.id} className="flex items-start gap-4 py-5">
-                  {/* Avatar */}
+                <div key={msg.id} className={`flex py-5 ${isUser ? "justify-end" : "items-start gap-4"}`}>
+                  {/* Avatar — only for agent messages */}
+                  {!isUser && (
                   <div
                     className={`mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center overflow-hidden ${
-                      isUser
-                        ? "rounded-full bg-muted"
-                        : matchedModel
+                      matchedModel
                           ? "rounded-lg bg-muted"
                           : "rounded-lg"
                     }`}
                     style={
-                      !isUser && !matchedModel
+                      !matchedModel
                         ? { background: getAgentColor(msg.agentName) }
                         : undefined
                     }
                   >
-                    {isUser ? (
-                      <User size={16} className="text-muted-foreground" />
-                    ) : matchedModel?.icon ? (
+                    {matchedModel?.icon ? (
                       <img
                         src={matchedModel.icon}
                         alt=""
@@ -3290,22 +3675,26 @@ export default function AgentOrchestrator() {
                       <Sparkles size={16} color="white" />
                     )}
                   </div>
+                  )}
 
                   {/* Content */}
-                  <div className="min-w-0 flex-1">
+                  <div className={isUser ? "max-w-[80%]" : "min-w-0 flex-1"}>
+                    {!isUser && (
                     <div className="mb-1 flex items-center gap-2 text-sm font-semibold text-foreground">
-                      {isUser ? t("You") : msg.agentName}
+                      {msg.agentName}
                       <span className="text-xs font-normal text-muted-foreground">
                         {msg.timestamp}
                       </span>
                     </div>
+                    )}
                     {isThinking ? (
                       <div className="flex items-center gap-2">
                         <Loader2 size={16} className="animate-spin text-muted-foreground" />
                         <span className="text-sm text-muted-foreground">{t("Thinking...")}</span>
                       </div>
                     ) : isUser ? (
-                      <div className="group/usermsg text-[15px] leading-relaxed text-foreground/80">
+                      <>
+                      <div className="group/usermsg rounded-lg bg-[#edf5fd] px-4 py-2.5 text-[15px] leading-relaxed text-foreground/80 shadow-sm dark:bg-accent">
                         {editingMsgId === msg.id && noAgentMode ? (
                           // Inline editor — matches MiBuddy's UX: textarea + Cancel/Send buttons
                           <div className="rounded-xl border border-border bg-muted/30 p-3">
@@ -3370,30 +3759,29 @@ export default function AgentOrchestrator() {
                                 })}
                               </div>
                             )}
-                            {/* Prompt action buttons — Copy and Edit
-                                Shown ONLY in model mode (No Agent), not when chatting with an agent.
-                                Always visible (no hover-only) — matches MiBuddy UX. */}
-                            {msg.content && !isSending && noAgentMode && (
-                              <div className="mt-1.5 flex items-center gap-1">
-                                <button
-                                  onClick={() => handleCopyMessage(msg.content, msg.id)}
-                                  className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
-                                  title={copiedMsgId === msg.id ? t("Copied!") : t("Copy")}
-                                >
-                                  {copiedMsgId === msg.id ? <Check size={13} className="text-green-600" /> : <Copy size={13} />}
-                                </button>
-                                <button
-                                  onClick={() => handleStartEdit(msg.id, msg.content)}
-                                  className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
-                                  title={t("Edit prompt")}
-                                >
-                                  <Pencil size={13} />
-                                </button>
-                              </div>
-                            )}
                           </>
                         )}
                       </div>
+                      {/* Prompt action buttons — Copy and Edit (outside bubble) */}
+                      {msg.content && !isSending && noAgentMode && (
+                        <div className="mt-1 flex items-center justify-end gap-1">
+                          <button
+                            onClick={() => handleCopyMessage(msg.content, msg.id)}
+                            className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
+                            title={copiedMsgId === msg.id ? t("Copied!") : t("Copy")}
+                          >
+                            {copiedMsgId === msg.id ? <Check size={13} className="text-green-600" /> : <Copy size={13} />}
+                          </button>
+                          <button
+                            onClick={() => handleStartEdit(msg.id, msg.content)}
+                            className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
+                            title={t("Edit prompt")}
+                          >
+                            <Pencil size={13} />
+                          </button>
+                        </div>
+                      )}
+                      </>
                     ) : (
                       <div className="text-[15px] leading-relaxed text-foreground/80">
                         {/* CoT Reasoning — collapsible pill + panel */}
@@ -3417,7 +3805,7 @@ export default function AgentOrchestrator() {
                             messageId={msg.id}
                             content={msg.content}
                             sessionId={currentSessionId || undefined}
-                            showDraftButton={isOutlookOrchConnected}
+                            showDraftButton={false}
                             onContentChange={(updated) => {
                               setMessages((prev) =>
                                 prev.map((m) =>
@@ -3437,6 +3825,34 @@ export default function AgentOrchestrator() {
                         {/* Action buttons row — hide when message contains a generated image */}
                         {msg.content && !isSending && !/!\[.*?\]\(.*?\)/.test(msg.content) && (
                           <div className="mt-1.5 flex items-center gap-1">
+                            <button
+                              onClick={() => handleThumbClick(msg, "up")}
+                              className={`flex h-7 w-7 items-center justify-center rounded-md transition-colors ${
+                                msg.feedbackRating === "up"
+                                  ? "text-red-500 hover:bg-red-50 dark:hover:bg-red-950/30"
+                                  : "text-muted-foreground hover:bg-accent hover:text-foreground"
+                              }`}
+                              title={msg.feedbackRating === "up" ? t("Remove rating") : t("Good response")}
+                            >
+                              <ThumbsUp
+                                size={13}
+                                fill={msg.feedbackRating === "up" ? "currentColor" : "none"}
+                              />
+                            </button>
+                            <button
+                              onClick={() => handleThumbClick(msg, "down")}
+                              className={`flex h-7 w-7 items-center justify-center rounded-md transition-colors ${
+                                msg.feedbackRating === "down"
+                                  ? "text-red-500 hover:bg-red-50 dark:hover:bg-red-950/30"
+                                  : "text-muted-foreground hover:bg-accent hover:text-foreground"
+                              }`}
+                              title={msg.feedbackRating === "down" ? t("Remove rating") : t("Bad response")}
+                            >
+                              <ThumbsDown
+                                size={13}
+                                fill={msg.feedbackRating === "down" ? "currentColor" : "none"}
+                              />
+                            </button>
                             <button
                               onClick={() => handleCopyMessage(msg.content, msg.id)}
                               className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
@@ -3479,12 +3895,44 @@ export default function AgentOrchestrator() {
                                     onClick={() => { handleExportText(msg.content); setExportMenuOpenId(null); }}
                                     className="flex w-full items-center gap-2 rounded-md px-3 py-1.5 text-left text-sm text-foreground hover:bg-accent"
                                   >
-                                    <File size={14} className="text-muted-foreground" />
+                                    <FileIcon size={14} className="text-muted-foreground" />
                                     <span>{t("Text")}</span>
                                   </button>
                                 </div>
                               )}
                             </div>
+                            {/* Share / More options menu — model replies only.
+                                Hidden on agent-deployment responses per product
+                                decision (Teams/Outlook share is a model feature). */}
+                            {!msg.isAgentResponse && (
+                              <div className="relative" data-share-menu>
+                                <button
+                                  onClick={() => setShareMenuOpenId(shareMenuOpenId === msg.id ? null : msg.id)}
+                                  className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground"
+                                  title={t("More options")}
+                                >
+                                  <MoreVertical size={13} />
+                                </button>
+                                {shareMenuOpenId === msg.id && (
+                                  <div className="absolute left-0 top-full z-50 mt-1 min-w-[180px] rounded-lg border border-border bg-popover p-1 shadow-lg">
+                                    <button
+                                      onClick={() => handleShareTeams(msg.content)}
+                                      className="flex w-full items-center gap-2 rounded-md px-3 py-1.5 text-left text-sm text-foreground hover:bg-accent"
+                                    >
+                                      <img src={shareTeamsIcon} alt="Teams" className="h-4 w-4 object-contain" />
+                                      <span>{t("Share on MsTeams")}</span>
+                                    </button>
+                                    <button
+                                      onClick={() => handleOutlookDraft(msg.content)}
+                                      className="flex w-full items-center gap-2 rounded-md px-3 py-1.5 text-left text-sm text-foreground hover:bg-accent"
+                                    >
+                                      <img src={outlookIcon} alt="Outlook" className="h-4 w-4 object-contain" />
+                                      <span>{t("Draft in Outlook")}</span>
+                                    </button>
+                                  </div>
+                                )}
+                              </div>
+                            )}
                           </div>
                         )}
                         {/* HITL action buttons */}
@@ -3592,7 +4040,7 @@ export default function AgentOrchestrator() {
           className={
             messages.length === 0 && !isSending
               ? "pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-6 px-6"
-              : "pointer-events-none absolute bottom-0 left-0 right-0 flex justify-center bg-gradient-to-t from-background from-40% to-transparent px-6 pb-6 transition-all"
+              : "pointer-events-none absolute bottom-0 left-0 right-0 flex justify-center bg-gradient-to-t from-background from-40% to-transparent px-6 pb-10 transition-all"
           }
         >
           {messages.length === 0 && !isSending && (
@@ -3709,7 +4157,13 @@ export default function AgentOrchestrator() {
                     <Image size={12} className="text-red-500" />
                     <span className="text-xs font-semibold text-red-500">{t("Image")}</span>
                     <button
-                      onClick={() => setImageMode(false)}
+                      onClick={() => {
+                        // Dismiss the Image chip and revert the dropdown from the
+                        // image-gen model (Nano Banana / DALL-E) back to MiBuddy AI.
+                        const mibuddy = aiModels.find((m) => /mibuddy[\s_-]?ai/i.test(m.name));
+                        if (mibuddy) setSelectedAiModel(mibuddy.id);
+                        setImageMode(false);
+                      }}
                       className="ml-0.5 rounded-full p-0.5 text-red-400 hover:bg-red-100 hover:text-red-600 dark:hover:bg-red-900/50"
                     >
                       <X size={10} />
@@ -3733,7 +4187,7 @@ export default function AgentOrchestrator() {
               )}
 
               {/* Single-line input row: [+] [img] [textarea grows] [mic] [send] */}
-              <div className="flex items-center gap-1 px-3 py-2">
+              <div className="flex items-end gap-1 px-3 py-2">
                 {/* ---- Addon: Plus menu button ----
                     In AGENT mode: directly opens the file picker (simpler UX).
                     In MODEL (No Agent) mode: opens the full menu with Create image, Canvas, etc. */}
@@ -3760,15 +4214,18 @@ export default function AgentOrchestrator() {
                   </button>
                 </div>
 
-                {/* Upload image button */}
-                <button
-                  onClick={() => fileInputRef.current?.click()}
-                  disabled={isSending || !canInteract || isSharedReadOnly || hasPendingHitl}
-                  className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors ${(isSending || !canInteract || isSharedReadOnly || hasPendingHitl) ? "cursor-not-allowed opacity-50" : "hover:bg-accent hover:text-foreground"}`}
-                  title={t("Upload image")}
-                >
-                  <ImagePlus size={18} />
-                </button>
+                {/* Upload image button — hidden when a model or agent is active;
+                    upload in those modes goes through the + menu instead. */}
+                {!((noAgentMode && selectedAiModel) || (!noAgentMode && selectedModelId)) && (
+                  <button
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={isSending || !canInteract || isSharedReadOnly || hasPendingHitl}
+                    className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors ${(isSending || !canInteract || isSharedReadOnly || hasPendingHitl) ? "cursor-not-allowed opacity-50" : "hover:bg-accent hover:text-foreground"}`}
+                    title={t("Upload image")}
+                  >
+                    <ImagePlus size={18} />
+                  </button>
+                )}
 
                 <textarea
                   ref={textareaRef}
@@ -3817,7 +4274,8 @@ export default function AgentOrchestrator() {
                             : t("Start typing with @ to chat with an agent")
                   }
                   rows={1}
-                  className={`min-w-0 flex-1 resize-none border-none bg-transparent px-2 py-1.5 text-[15px] leading-6 text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-0 ${(isSending || !canInteract || isSharedReadOnly || hasPendingHitl) ? "cursor-not-allowed opacity-50" : ""}`}
+                  style={{ maxHeight: TEXTAREA_MAX_HEIGHT }}
+                  className={`min-w-0 flex-1 resize-none overflow-y-hidden border-none bg-transparent px-2 py-1.5 text-[15px] leading-6 text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-0 ${(isSending || !canInteract || isSharedReadOnly || hasPendingHitl) ? "cursor-not-allowed opacity-50" : ""}`}
                 />
 
                 <input
@@ -3860,13 +4318,26 @@ export default function AgentOrchestrator() {
               </div>
             </div>
 
-            <div className="mt-2 text-center text-xs text-muted-foreground">
-              {t("Agents can make mistakes. Review important info.")}
-            </div>
           </div>
+        </div>
+
+        {/* Disclaimer — bottom-left, matching MiBuddy style */}
+        <div className="pointer-events-none absolute bottom-1 left-5 text-xs text-muted-foreground">
+          {t("Generative AI may display inaccurate information, including about people, so double-check its responses.")}
         </div>
       </div>
       )}
+      {/* ---- Thumbs up/down feedback popup (MiBuddy-parity) ---- */}
+      {feedbackPopup && (
+        <FeedbackPopup
+          mode={feedbackPopup.mode}
+          initialReasons={feedbackPopup.initialReasons}
+          initialComment={feedbackPopup.initialComment}
+          onSubmit={handleSubmitFeedback}
+          onClose={() => setFeedbackPopup(null)}
+        />
+      )}
+
       {/* ---- Addon: SharePoint File Picker (MSAL-based) ---- */}
       <SharePointFilePicker
         isOpen={spPickerOpen}
@@ -4038,7 +4509,7 @@ export default function AgentOrchestrator() {
                   {item.type === "folder" ? (
                     <Folder size={20} className="shrink-0 text-blue-500" />
                   ) : (
-                    <File size={20} className="shrink-0 text-muted-foreground" />
+                    <FileIcon size={20} className="shrink-0 text-muted-foreground" />
                   )}
                   <div className="min-w-0 flex-1">
                     <div className="truncate font-medium">{item.name}</div>
