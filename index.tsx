@@ -374,10 +374,16 @@ interface AiModelOption {
 
 // Resolve a model logo by matching id/name/provider against known patterns.
 function resolveModelIcon(model: { model_id?: string; model_name?: string; display_name?: string; provider?: string }): string {
-  const hay = `${model.model_id || ""} ${model.model_name || ""} ${model.display_name || ""}`.toLowerCase();
-  const provider = (model.provider || "").toLowerCase();
+  // If display_name starts with "mibuddy", always show mibuddy icon regardless of model family.
+  // Only check display_name — model_id may contain "mibuddy" as a prefix for all models (e.g. "mibuddy-gpt-5.2-chat").
+  const displayName = (model.display_name || "").toLowerCase();
+  if (/^mibuddy/.test(displayName)) return micoreLogo;
 
-  if (/mibuddy|mi[\s_-]?core|micore/.test(hay)) return micoreLogo;
+  // Combine all name fields + provider so we can match the actual model family
+  // even when it's deployed behind a provider like Azure.
+  const hay = `${model.model_id || ""} ${model.model_name || ""} ${model.display_name || ""} ${model.provider || ""}`.toLowerCase();
+
+  // 1. Match specific model families first (order matters — most specific first)
   if (/dall[\s_-]?e/.test(hay)) return dalleLogo;
   if (/grok/.test(hay)) return grokLogo;
   if (/nano[\s_-]?banana/.test(hay)) return nanoBananaLogo;
@@ -390,12 +396,15 @@ function resolveModelIcon(model: { model_id?: string; model_name?: string; displ
   if (/perplexity|sonar/.test(hay)) return perplexityLogo;
   if (/nvidia|nemotron/.test(hay)) return nvidiaLogo;
   if (/hugging[\s_-]?face/.test(hay)) return huggingfaceLogo;
-  if (/gpt|openai|o1|o3|o4/.test(hay)) return openaiLogo;
-  if (/azure/.test(hay)) return azureLogo;
+  if (/gpt|openai|o[13][\s_-]|o[13]$|o4/.test(hay)) return openaiLogo;
 
-  // Provider fallbacks
+  // 2. MiBuddy / MiCore — only if no known model family matched above
+  if (/mibuddy|mi[\s_-]?core|micore/.test(hay)) return micoreLogo;
+
+  // 3. Provider-based fallbacks (e.g. azure with a custom deployment name)
+  const provider = (model.provider || "").toLowerCase();
   if (provider === "openai" || provider === "openai_compatible") return openaiLogo;
-  if (provider === "azure") return azureLogo;
+  if (provider === "azure" || provider === "azure_ai") return micoreLogo;
   if (provider === "anthropic") return claudeLogo;
   if (provider === "google" || provider === "google_vertex") return geminiLogo;
   return defaultLlmLogo;
@@ -2459,6 +2468,7 @@ export default function AgentOrchestrator() {
     setNoAgentMode(true);
     setShowImageGallery(false);
     setIsSharedReadOnly(false);
+    setIsCanvasEnabled(false);
   };
 
   const handleSelectSession = (sessionId: string) => {
@@ -2862,7 +2872,7 @@ export default function AgentOrchestrator() {
               </div>
               <div className="flex flex-col gap-0.5">
                 <button
-                  onClick={() => window.open("https://translator.motherson.com", "_blank")}
+                  onClick={() => window.open("https://translator.ai.motherson.com", "_blank")}
                   className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
                 >
                   <img src={translatorLogo} alt="" className="h-4 w-4 shrink-0 object-contain" />
@@ -3628,6 +3638,8 @@ export default function AgentOrchestrator() {
 
               const isUser = msg.sender === "user";
               const isThinking = msg.sender === "agent" && msg.content === "" && isSending;
+              const isInlineEditingUserMessage =
+                isUser && editingMsgId === msg.id && noAgentMode;
 
               // Canvas: any agent message can be edited via canvas
               const isEditingThis = canvasEditingId === msg.id;
@@ -3688,7 +3700,15 @@ export default function AgentOrchestrator() {
                   )}
 
                   {/* Content */}
-                  <div className={isUser ? "max-w-[80%]" : "min-w-0 flex-1"}>
+                  <div
+                    className={
+                      isUser
+                        ? isInlineEditingUserMessage
+                          ? "w-full max-w-full"
+                          : "max-w-[80%]"
+                        : "min-w-0 flex-1"
+                    }
+                  >
                     {!isUser && (
                     <div className="mb-1 flex items-center gap-2 text-sm font-semibold text-foreground">
                       {msg.agentName}
@@ -3704,7 +3724,11 @@ export default function AgentOrchestrator() {
                       </div>
                     ) : isUser ? (
                       <>
-                      <div className="group/usermsg rounded-lg bg-[#edf5fd] px-4 py-2.5 text-[15px] leading-relaxed text-foreground/80 shadow-sm dark:bg-accent">
+                      <div
+                        className={`group/usermsg rounded-lg bg-[#edf5fd] px-4 py-2.5 text-[15px] leading-relaxed text-foreground/80 shadow-sm dark:bg-accent ${
+                          isInlineEditingUserMessage ? "w-full" : ""
+                        }`}
+                      >
                         {editingMsgId === msg.id && noAgentMode ? (
                           // Inline editor — matches MiBuddy's UX: textarea + Cancel/Send buttons
                           <div className="rounded-xl border border-border bg-muted/30 p-3">
@@ -3832,8 +3856,13 @@ export default function AgentOrchestrator() {
                             editedFlag={null}
                           />
                         )}
-                        {/* Action buttons row — hide when message contains a generated image */}
-                        {msg.content && !isSending && !/!\[.*?\]\(.*?\)/.test(msg.content) && (
+                        {/* Action buttons row — show on every assistant message,
+                            including image-generation replies. Thumbs/copy/share
+                            all operate on the accompanying text (captions like
+                            "Here is your generated image."); download + share
+                            naturally apply to the image itself because the image
+                            URL lives in the same markdown. */}
+                        {msg.content && !isSending && (
                           <div className="mt-1.5 flex items-center gap-1">
                             <button
                               onClick={() => handleThumbClick(msg, "up")}
