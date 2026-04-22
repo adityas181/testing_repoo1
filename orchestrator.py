@@ -1555,10 +1555,13 @@ async def orch_chat(
 
         elif mode == "image_gen":
             from agentcore.services.mibuddy.image_gen_handler import handle_image_generation
+            # Pass session_id so the handler can detect edit requests and
+            # use the last generated image in the session as a reference.
             result = await handle_image_generation(
                 body.input_value,
                 model_id=str(resp_model_id) if resp_model_id else None,
                 user_id=str(current_user.id),
+                session_id=body.session_id,
             )
             response_text = result["response_text"]
             resp_model_name = result.get("model_name", "image-generation")
@@ -1945,11 +1948,14 @@ async def orch_chat_stream(
                     logger.warning(f"[ORCH-STREAM] RESPONSE preview: {_rt[:300]!r}")
                 elif _mode == "image_gen":
                     from agentcore.services.mibuddy.image_gen_handler import handle_image_generation_stream
+                    # session_id → enables the image-edit flow when the user
+                    # asks to modify a previously-generated image.
                     result = await handle_image_generation_stream(
                         _input_value,
                         model_id=str(_resp_model_id) if _resp_model_id else None,
                         user_id=str(_user_id),
                         event_manager=event_manager,
+                        session_id=_session_id,
                     )
                 elif _mode == "outlook_query":
                     # Port of MiBuddy's outlook_agent_node. Runs to completion
@@ -2590,6 +2596,7 @@ async def edit_orch_message(
                 body.edited_text,
                 model_id=str(resp_model_id),
                 user_id=str(current_user.id),
+                session_id=user_msg.session_id,
             )
             new_response_text = result.get("response_text", "")
             new_model_name = result.get("model_name", "image-generation")

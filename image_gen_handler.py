@@ -26,6 +26,132 @@ def _get_settings():
 
 
 # ---------------------------------------------------------------------------
+# Image editing support (MiBuddy-parity)
+# ---------------------------------------------------------------------------
+
+# Keywords that strongly imply the user wants to EDIT a prior image rather
+# than generate a brand-new one. Lifted from MiBuddy's
+# `is_image_modification_request` (backend/utils/image_storage.py).
+_MODIFICATION_KEYWORDS = {
+    "change", "modify", "edit", "make", "turn", "replace", "update",
+    "convert", "alter", "adjust", "add", "remove", "delete", "insert",
+    "apply", "swap",
+}
+# Pronouns that usually refer to the previous image when context exists
+# ("make IT bigger", "change THAT to blue", etc.)
+_PRONOUN_REFS = {"it", "this", "that", "them", "these", "those", "its"}
+
+# How many recent assistant messages in the session to scan when looking
+# for the last generated image. Matches MiBuddy (they scan last 6).
+_LAST_IMAGE_LOOKBACK_MSGS = 6
+
+
+def is_image_modification_request(prompt: str, has_previous_image: bool) -> bool:
+    """Return True when the prompt looks like an edit of an existing image.
+
+    Matches MiBuddy's heuristic: a modification keyword OR a pronoun
+    reference, gated on there actually being a previous image in context.
+    Without a previous image we always treat requests as fresh generation.
+    """
+    if not has_previous_image:
+        return False
+    words = set(prompt.lower().replace(",", " ").replace(".", " ").split())
+    has_modifier = bool(words & _MODIFICATION_KEYWORDS)
+    has_pronoun = bool(words & _PRONOUN_REFS)
+    return has_modifier or has_pronoun
+
+
+async def _get_last_generated_image(session_id: str, user_id: str) -> bytes | None:
+    """Fetch the most recent AI-generated image from the session as raw bytes.
+
+    Scans the last `_LAST_IMAGE_LOOKBACK_MSGS` assistant messages for image
+    markdown (`![...](<url>)`) and downloads the first match it finds
+    (messages are ordered newest-first). Handles three URL shapes:
+      - raw Azure blob URL (public container)
+      - auth-proxied `/api/files/images/...` URL (requires user-id mapping)
+      - inline `data:image/png;base64,...` URLs
+
+    Returns image bytes or None if no recoverable image is found. Failures
+    are logged and swallowed — the caller falls back to fresh generation.
+    """
+    import re
+    try:
+        from sqlmodel import select
+        from agentcore.services.deps import session_scope
+        from agentcore.services.database.models.orch_conversation.model import OrchConversationTable
+    except Exception as e:
+        logger.debug(f"[ImageGen] Could not import DB deps for image lookup: {e}")
+        return None
+
+    try:
+        async with session_scope() as db:
+            stmt = (
+                select(OrchConversationTable)
+                .where(
+                    OrchConversationTable.session_id == session_id,
+                    # Assistant messages are stored as sender="agent" or "model"
+                    # depending on whether they came from an agent deployment
+                    # or direct model chat. Match either.
+                    OrchConversationTable.sender.in_(("agent", "model")),
+                )
+                .order_by(OrchConversationTable.timestamp.desc())
+                .limit(_LAST_IMAGE_LOOKBACK_MSGS)
+            )
+            rows = (await db.exec(stmt)).all()
+    except Exception as e:
+        logger.warning(f"[ImageGen] Query for prior image failed: {e}")
+        return None
+
+    img_md_re = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
+    for row in rows:
+        text = getattr(row, "text", "") or ""
+        match = img_md_re.search(text)
+        if not match:
+            continue
+        url = match.group(1).strip()
+        logger.info(f"[ImageGen] Found prior image URL in msg {row.id}: {url[:80]}...")
+
+        # Case 1: inline base64 data URL
+        if url.startswith("data:image/"):
+            try:
+                import base64
+                _, b64 = url.split(",", 1)
+                return base64.b64decode(b64)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[ImageGen] Failed to decode inline image: {exc}")
+                continue
+
+        # Case 2: auth-proxied URL served by agentcore (/api/files/images/...)
+        # The file path format is {user_id}/generated-images/{filename}. Read
+        # directly from MiBuddy blob storage to avoid a self-HTTP call.
+        if "/api/files/images/" in url or "/orchestrator/images/" in url:
+            try:
+                from agentcore.services.mibuddy.docqa_storage import get_file_by_path
+                # Extract path after "/images/"
+                parts = url.split("/images/", 1)
+                if len(parts) == 2:
+                    storage_path = parts[1].split("?", 1)[0]  # strip query string
+                    return await get_file_by_path(storage_path)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[ImageGen] Failed to read from storage: {exc}")
+                continue
+
+        # Case 3: public/SAS blob URL — fetch over HTTP
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                resp = await client.get(url)
+                if resp.status_code == 200:
+                    return resp.content
+                logger.debug(f"[ImageGen] GET {url[:60]}... → {resp.status_code}")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[ImageGen] HTTP fetch failed: {exc}")
+            continue
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Image prompt safety enhancement
 # ---------------------------------------------------------------------------
 
@@ -414,11 +540,22 @@ async def _generate_dalle_azure(prompt: str, config: dict) -> dict:
 # Nano Banana (Google Vertex AI Gemini image generation)
 # ---------------------------------------------------------------------------
 
-async def _generate_nano_banana(prompt: str, config: dict) -> dict:
-    """Generate image via Google Vertex AI Gemini using registry config.
+async def _generate_nano_banana(
+    prompt: str,
+    config: dict,
+    reference_image_bytes: bytes | None = None,
+) -> dict:
+    """Generate or EDIT an image via Google Vertex AI Gemini.
+
+    When `reference_image_bytes` is provided, the call becomes an edit:
+    the image is attached as `inlineData` on the request, and the prompt
+    switches to a preservation-focused template that instructs the model
+    to apply only the requested change while keeping the rest of the
+    scene intact (matches MiBuddy's behaviour in
+    `backend/utils/model.py::generate_image_nanobanana`).
 
     Registry model should have:
-    - provider: "google"
+    - provider: "google" / "google_vertex" / "google_genai_vertex"
     - api_key: service account JSON content or path
     - provider_config.project_id: GCP project ID
     - provider_config.location: region (default: us-central1)
@@ -469,9 +606,27 @@ async def _generate_nano_banana(prompt: str, config: dict) -> dict:
         endpoint = f"https://{location}-aiplatform.googleapis.com/v1/{vertex_model}:generateContent"
 
         safe_prompt = _apply_safety_to_prompt(prompt)
-        enhanced_prompt = f"Generate a high-quality image of: {safe_prompt}"
+        # Branch the prompt + request body depending on whether we're editing
+        # a prior image or generating one from scratch.
+        parts: list[dict] = []
+        if reference_image_bytes:
+            import base64 as _b64
+            ref_b64 = _b64.b64encode(reference_image_bytes).decode("utf-8")
+            enhanced_prompt = (
+                "Edit the provided reference image using it as the base.\n"
+                f"- Apply ONLY this requested modification: {safe_prompt}\n"
+                "- Preserve composition, subjects, camera angle, and overall scene identity.\n"
+                "- Adjust lighting, reflections, and color interactions only when required for realism.\n"
+                "- Do NOT redesign the scene or change unrelated elements."
+            )
+            parts.append({"text": enhanced_prompt})
+            parts.append({"inlineData": {"mimeType": "image/png", "data": ref_b64}})
+            logger.info(f"[ImageGen] Editing reference image ({len(reference_image_bytes)} bytes)")
+        else:
+            enhanced_prompt = f"Generate a high-quality image of: {safe_prompt}"
+            parts.append({"text": enhanced_prompt})
 
-        body = {"contents": [{"role": "user", "parts": [{"text": enhanced_prompt}]}]}
+        body = {"contents": [{"role": "user", "parts": parts}]}
 
         max_retries = 3
         for attempt in range(max_retries):
@@ -561,8 +716,20 @@ async def _find_image_model_by_name() -> dict | None:
     return None
 
 
-async def handle_image_generation(query: str, model_id: str | None = None, user_id: str | None = None) -> dict:
-    """Generate an image using a model from the registry.
+async def handle_image_generation(
+    query: str,
+    model_id: str | None = None,
+    user_id: str | None = None,
+    session_id: str | None = None,
+) -> dict:
+    """Generate or EDIT an image using a model from the registry.
+
+    When `session_id` is provided, the handler checks the session's recent
+    assistant messages for a previously generated image. If the user's
+    prompt looks like an edit request (keywords: change / modify / add /
+    remove / etc., or pronoun references like "it") AND a prior image
+    exists, Nano Banana is called in image-to-image mode with the prior
+    image as a reference. Otherwise the call is a fresh generation.
 
     Finds the image model by:
     1. IMAGE_GEN_MODEL_NAME setting (display name match in registry)
@@ -601,12 +768,33 @@ async def handle_image_generation(query: str, model_id: str | None = None, user_
 
         logger.info(f"[ImageGen] Provider={provider}, model={model_name}")
 
+        # --- Image-edit detection: look up the last generated image in this
+        # session so we can pass it to Nano Banana as a reference when the
+        # user's prompt implies a modification. Only Nano Banana (Vertex AI
+        # Gemini) supports this today — DALL-E / Azure DALL-E use a
+        # different "edits" API that isn't wired up here.
+        reference_image_bytes: bytes | None = None
+        is_edit = False
+        if session_id and user_id:
+            prior_bytes = await _get_last_generated_image(session_id, user_id)
+            if prior_bytes and is_image_modification_request(query, True):
+                reference_image_bytes = prior_bytes
+                is_edit = True
+                logger.info(
+                    f"[ImageGen] Detected edit request for {len(prior_bytes)} byte prior image"
+                )
+
         # Route to correct backend
-        if provider in ("google", "google_vertex") or "gemini" in model_name:
-            result = await _generate_nano_banana(query, config)
+        if provider in ("google", "google_vertex", "google_genai_vertex") or "gemini" in model_name:
+            result = await _generate_nano_banana(query, config, reference_image_bytes=reference_image_bytes)
         elif provider == "azure" and "dall" in model_name:
+            # DALL-E edits API isn't wired here — fall back to fresh generation.
+            if is_edit:
+                logger.info("[ImageGen] Edit requested but DALL-E edits path not implemented — doing fresh generation")
             result = await _generate_dalle_azure(query, config)
         elif provider == "openai" and "dall" in model_name:
+            if is_edit:
+                logger.info("[ImageGen] Edit requested but DALL-E edits path not implemented — doing fresh generation")
             result = await _generate_dalle_openai(query, config)
         elif provider in ("openai", "azure"):
             result = await _generate_dalle_openai(query, config) if provider == "openai" else await _generate_dalle_azure(query, config)
@@ -655,12 +843,23 @@ async def _generate_via_chat_model(query: str, config: dict) -> dict:
     return {"response_text": response_text, "model_name": metadata.get("model_name", "image-generation")}
 
 
-async def handle_image_generation_stream(query: str, model_id: str | None = None, user_id: str | None = None, event_manager=None) -> dict:
+async def handle_image_generation_stream(
+    query: str,
+    model_id: str | None = None,
+    user_id: str | None = None,
+    event_manager=None,
+    session_id: str | None = None,
+) -> dict:
     """Image generation with progress events (not truly streaming)."""
     if event_manager:
         event_manager.on_token(data={"chunk": "Generating image... "})
 
-    result = await handle_image_generation(query, model_id=model_id, user_id=user_id)
+    result = await handle_image_generation(
+        query,
+        model_id=model_id,
+        user_id=user_id,
+        session_id=session_id,
+    )
 
     if event_manager:
         event_manager.on_token(data={"chunk": result["response_text"]})
