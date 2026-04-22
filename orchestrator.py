@@ -1552,6 +1552,22 @@ async def orch_chat(
             else:
                 settings_svc = get_settings_service().settings
                 sender_name = settings_svc.web_search_model_name or "Web Search"
+                # Mirror image_gen behavior: point routed_model_id to the
+                # configured web-search specialist row so the dropdown reflects
+                # the routed model during this turn.
+                try:
+                    from agentcore.services.model_service_client import fetch_registry_models_async
+                    ws_name = (settings_svc.web_search_model_name or "").strip().lower()
+                    if ws_name:
+                        _all = await fetch_registry_models_async(active_only=True) or []
+                        _match = next(
+                            (m for m in _all if (m.get("display_name") or "").strip().lower() == ws_name),
+                            None,
+                        )
+                        if _match and _match.get("id"):
+                            resp_model_id = UUID(str(_match["id"]))
+                except Exception:
+                    pass
 
         elif mode == "image_gen":
             from agentcore.services.mibuddy.image_gen_handler import handle_image_generation
@@ -1775,14 +1791,18 @@ async def orch_chat_stream(
             else:
                 settings_svc = get_settings_service().settings
                 sender_name = settings_svc.web_search_model_name or "Web Search"
-                # Override resp_model_id to the WEB_SEARCH_MODEL_NAME registry entry
-                # so the frontend can auto-switch the dropdown to it.
+                # Mirror image_gen behavior: point routed_model_id to the
+                # configured web-search specialist row so the dropdown reflects
+                # the routed model during this turn.
                 try:
                     from agentcore.services.model_service_client import fetch_registry_models_async
                     ws_name = (settings_svc.web_search_model_name or "").strip().lower()
                     if ws_name:
                         _all = await fetch_registry_models_async(active_only=True) or []
-                        _match = next((m for m in _all if (m.get("display_name") or "").strip().lower() == ws_name), None)
+                        _match = next(
+                            (m for m in _all if (m.get("display_name") or "").strip().lower() == ws_name),
+                            None,
+                        )
                         if _match and _match.get("id"):
                             resp_model_id = UUID(str(_match["id"]))
                 except Exception:
