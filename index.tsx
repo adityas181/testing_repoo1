@@ -324,6 +324,55 @@ function mapApiMessages(apiMessages: OrchMessageResponse[]): Message[] {
   });
 }
 
+type SessionSelectionHint =
+  | { mode: "agent"; deploymentId?: string; agentId?: string }
+  | { mode: "model"; modelId: string }
+  | null;
+
+function inferSessionSelectionHint(messages: OrchMessageResponse[]): SessionSelectionHint {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const msg = messages[i];
+    if (!msg || (msg.category && msg.category !== "message")) continue;
+
+    const deploymentId = msg.deployment_id || undefined;
+    const agentId = msg.agent_id || undefined;
+    if (deploymentId || agentId) {
+      return { mode: "agent", deploymentId, agentId };
+    }
+
+    const modelId = (msg as any).model_id || undefined;
+    if (modelId) {
+      return { mode: "model", modelId };
+    }
+  }
+  return null;
+}
+
+function findAgentFromSessionSummary(
+  sessionInfo: OrchSessionSummary | undefined,
+  agents: Agent[],
+): Agent | undefined {
+  if (!sessionInfo) return undefined;
+
+  if (sessionInfo.active_deployment_id) {
+    const byDeployment = agents.find(
+      (a) => a.id === sessionInfo.active_deployment_id || a.deploy_id === sessionInfo.active_deployment_id,
+    );
+    if (byDeployment) return byDeployment;
+  }
+
+  if (sessionInfo.active_agent_id) {
+    const byAgentId = agents.find((a) => a.agent_id === sessionInfo.active_agent_id);
+    if (byAgentId) return byAgentId;
+  }
+
+  if (sessionInfo.active_agent_name) {
+    return agents.find((a) => a.name === sessionInfo.active_agent_name);
+  }
+
+  return undefined;
+}
+
 function hitlStatusLabel(value: string): string {
   const normalized = (value || "").toLowerCase();
   if (normalized.includes("reject")) return "Rejected";
@@ -918,6 +967,7 @@ export default function AgentOrchestrator() {
   const modelPickerRef = useRef<HTMLDivElement>(null);
   const aiModelPickerRef = useRef<HTMLDivElement>(null);
   const hitlSessionRef = useRef<string | null>(null);
+  const sessionSelectionSyncRef = useRef<string | null>(null);
 
   /* ------------------ FILE UPLOAD ------------------ */
 
@@ -1135,6 +1185,12 @@ export default function AgentOrchestrator() {
     return null;
   }, [activeSessionId, currentSessionId, apiSessions]);
 
+  useEffect(() => {
+    if (!effectiveSessionId) {
+      sessionSelectionSyncRef.current = null;
+    }
+  }, [effectiveSessionId]);
+
   // Load messages when switching to an existing session
   const { data: apiSessionMessages, refetch: refetchMessages } = useGetOrchMessages(
     { session_id: effectiveSessionId || "" },
@@ -1203,16 +1259,62 @@ export default function AgentOrchestrator() {
         hitlSessionRef.current = effectiveSessionId;
       }
 
-      // Sync selected model with the session's active agent
-      const sessionInfo = apiSessions?.find((s) => s.session_id === effectiveSessionId);
-      if (sessionInfo?.active_agent_name) {
-        const activeAgent = agents.find((a) => a.name === sessionInfo.active_agent_name);
-        if (activeAgent) {
-          setSelectedModelId(activeAgent.id);
+      // Restore session-specific selection (agent vs model) only once per
+      // session switch so polling doesn't override user's in-progress choice.
+      if (sessionSelectionSyncRef.current !== effectiveSessionId) {
+        const sessionInfo = apiSessions?.find((s) => s.session_id === effectiveSessionId);
+        const hint = inferSessionSelectionHint(apiSessionMessages);
+
+        if (hint?.mode === "model") {
+          setSelectedModelId("");
+          setNoAgentMode(true);
+          setSelectedAiModel(hint.modelId);
+          setHeaderModelOverride(null);
+          sessionSelectionSyncRef.current = effectiveSessionId;
+          return;
         }
+
+        if (hint?.mode === "agent") {
+          let deploymentId = hint.deploymentId;
+          if (!deploymentId && hint.agentId) {
+            deploymentId = agents.find((a) => a.agent_id === hint.agentId)?.id;
+          }
+          if (deploymentId) {
+            setSelectedModelId(deploymentId);
+            setNoAgentMode(false);
+            setHeaderModelOverride(null);
+            sessionSelectionSyncRef.current = effectiveSessionId;
+            return;
+          }
+          // Wait for agents to load if we only got agent_id.
+          if (hint.agentId && agents.length === 0) {
+            return;
+          }
+        }
+
+        const fallbackAgent = findAgentFromSessionSummary(sessionInfo, agents);
+        if (fallbackAgent) {
+          setSelectedModelId(fallbackAgent.id);
+          setNoAgentMode(false);
+          setHeaderModelOverride(null);
+          sessionSelectionSyncRef.current = effectiveSessionId;
+          return;
+        }
+
+        const hasAgentInSummary =
+          !!sessionInfo?.active_agent_id
+          || !!sessionInfo?.active_deployment_id
+          || !!sessionInfo?.active_agent_name;
+
+        if (hasAgentInSummary && agents.length === 0) {
+          return;
+        }
+
+        // No restorable session mode found: keep current/default UI state.
+        sessionSelectionSyncRef.current = effectiveSessionId;
       }
     }
-  }, [apiSessionMessages, effectiveSessionId, apiSessions, agents]);
+  }, [apiSessionMessages, effectiveSessionId, apiSessions, agents, isSending, currentSessionId]);
 
   /* Resolve a pending share-link session once the user's own session
    * list has loaded. If the shared session belongs to the viewer, take
@@ -1314,6 +1416,9 @@ export default function AgentOrchestrator() {
   useEffect(() => {
     if (didDefaultSelectRef.current) return;
     if (aiModels.length === 0) return;
+    // If an existing session is open, restore that session's selection
+    // instead of forcing the page-level default model.
+    if (effectiveSessionId) return;
     didDefaultSelectRef.current = true;
     const mibuddy = aiModels.find((m) => /mibuddy[\s_-]?ai/i.test(m.name));
     const defaultModel = mibuddy || aiModels.find((m) => m.is_default) || aiModels[0];
@@ -1322,7 +1427,7 @@ export default function AgentOrchestrator() {
       setNoAgentMode(true);
       setSelectedModelId("");
     }
-  }, [aiModels]);
+  }, [aiModels, effectiveSessionId]);
 
   // Keep HITL status in sync when decisions happen on HITL Approvals page.
   // This lets orchestrator chat hide the pending banner and show final status
@@ -2508,6 +2613,8 @@ export default function AgentOrchestrator() {
     setMessages([]);
     setSelectedModelId("");
     setNoAgentMode(true);
+    setHeaderModelOverride(null);
+    sessionSelectionSyncRef.current = null;
     setShowImageGallery(false);
     setIsSharedReadOnly(false);
     setIsCanvasEnabled(false);
