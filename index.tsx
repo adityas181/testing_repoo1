@@ -46,7 +46,7 @@ import cohereLogo from "@/assets/cohere_logo.svg";
 import perplexityLogo from "@/assets/perplexity_logo.svg";
 import nvidiaLogo from "@/assets/nvidia_logo.svg";
 import huggingfaceLogo from "@/assets/huggingface_logo.svg";
-import micoreLogo from "@/assets/micore.svg";
+import micoreLogo from "@/assets/mibuddy_logo.png";
 import grokLogo from "@/assets/grok_logo.png";
 import nanoBananaLogo from "@/assets/nano_banana_logo.png";
 import dalleLogo from "@/assets/dalle_logo.svg";
@@ -516,7 +516,7 @@ function ImageGalleryView({
       const isPublicBlob = /\.blob\.core\.windows\.net\//i.test(src);
       const headers: Record<string, string> = {};
       if (!isPublicBlob) {
-        const tokenMatch = document.cookie.match(/(?:^|;\s*)access_token_lf=([^;]*)/);
+        const tokenMatch = document.cookie.match(/(?:^|;\s*)access_token_ag=([^;]*)/);
         if (tokenMatch?.[1]) {
           headers["Authorization"] = `Bearer ${decodeURIComponent(tokenMatch[1])}`;
         }
@@ -580,7 +580,7 @@ function ImageGalleryView({
       const isPublicBlob = /\.blob\.core\.windows\.net\//i.test(shareUrl);
       const headers: Record<string, string> = {};
       if (!isPublicBlob) {
-        const tokenMatch = document.cookie.match(/(?:^|;\s*)access_token_lf=([^;]*)/);
+        const tokenMatch = document.cookie.match(/(?:^|;\s*)access_token_ag=([^;]*)/);
         if (tokenMatch?.[1]) {
           headers["Authorization"] = `Bearer ${decodeURIComponent(tokenMatch[1])}`;
         }
@@ -1709,11 +1709,12 @@ export default function AgentOrchestrator() {
 
   const handleInputChange = (value: string) => {
     setInput(value);
-    // Allow @-mentions in BOTH model mode and agent mode. If the user is in
-    // model mode and picks an agent, `handleSelectAgent` below will flip
-    // them into agent mode automatically.
+    // @-mentions only open the agent picker on a fresh chat. Once a model-mode
+    // conversation is in progress, typing "@" must NOT switch the user to an
+    // agent — they need to start a New Chat to change agent/model context.
+    const inActiveModelChat = noAgentMode && messages.length > 0;
     const match = value.match(/@([\w\s().-]*)$/);
-    if (match && agents.length > 0) {
+    if (match && agents.length > 0 && !inActiveModelChat) {
       const query = match[1].toLowerCase();
       setFilteredAgents(agents.filter((a) => a.name.toLowerCase().includes(query)));
       setShowMentions(true);
@@ -2024,7 +2025,7 @@ export default function AgentOrchestrator() {
     try {
       setIsSending(true);
       const headers: Record<string, string> = { "Content-Type": "application/json" };
-      const tokenMatch = document.cookie.match(/(?:^|;\s*)access_token_lf=([^;]*)/);
+      const tokenMatch = document.cookie.match(/(?:^|;\s*)access_token_ag=([^;]*)/);
       if (tokenMatch?.[1]) headers["Authorization"] = `Bearer ${decodeURIComponent(tokenMatch[1])}`;
       const res = await fetch(
         `${getURL("ORCHESTRATOR")}/messages/${msgIdBeingEdited}/edit`,
@@ -2154,11 +2155,12 @@ export default function AgentOrchestrator() {
       }
     }
 
-    // Collect uploaded file paths and clear previews
+    // Collect uploaded file paths (pure read — clearing the state is deferred
+    // until we're sure we're actually sending, so the user doesn't lose their
+    // attachments if the message turns out to be empty after sanitisation).
     const filePaths = uploadFiles
       .filter((f) => f.path && !f.loading && !f.error)
       .map((f) => f.path!);
-    setUploadFiles([]);
 
     const fallbackAgent = selectedAgent || agents[0];
 
@@ -2172,6 +2174,16 @@ export default function AgentOrchestrator() {
     const cleanedInput = explicitAgent
       ? effectiveInput.replace(new RegExp(`@${escapedName}\\s*`, "g"), "").trim()
       : effectiveInput.trim();
+
+    // After stripping the @mention and trimming, the actual question may be
+    // empty (e.g. user typed just "@agent_name " with no real prompt). Don't
+    // ship a blank message to the backend — bail and let the user finish.
+    if (!cleanedInput && filePaths.length === 0) {
+      return;
+    }
+
+    // From here we're committed to sending — clear the upload previews now.
+    setUploadFiles([]);
 
     // Agent message placeholder — created upfront so "Thinking..." shows inside the bubble
     const agentMsgId = crypto.randomUUID();
@@ -2618,6 +2630,14 @@ export default function AgentOrchestrator() {
     setShowImageGallery(false);
     setIsSharedReadOnly(false);
     setIsCanvasEnabled(false);
+    // Snap the model dropdown back to the default (MiBuddy AI). Otherwise a
+    // prior turn that auto-switched to an image model (e.g. Nano Banana) would
+    // leak into the new chat. Same priority order as the page-load default.
+    if (aiModels.length > 0) {
+      const mibuddy = aiModels.find((m) => /mibuddy[\s_-]?ai/i.test(m.name));
+      const defaultModel = mibuddy || aiModels.find((m) => m.is_default) || aiModels[0];
+      if (defaultModel) setSelectedAiModel(defaultModel.id);
+    }
   };
 
   const handleSelectSession = (sessionId: string) => {
@@ -3019,8 +3039,11 @@ export default function AgentOrchestrator() {
               <div className="px-3 pb-1 text-xxs font-semibold uppercase tracking-wide text-muted-foreground">
                 {t("Applications")}
               </div>
-              <div className="flex flex-col gap-0.5">
-                <button
+              <div
+                className="flex max-h-[11.25rem] flex-col gap-0.5 overflow-y-auto scroll-smooth"
+                style={{ scrollbarWidth: "thin" }}
+              >
+                {/* <button
                   onClick={() => window.open("https://translator.ai.motherson.com", "_blank")}
                   className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
                 >
@@ -3043,6 +3066,78 @@ export default function AgentOrchestrator() {
                 >
                   <img src={notebookLMLogo} alt="" className="h-4 w-4 shrink-0 object-contain" />
                   <span>{t("NotebookLM")}</span>
+                </button> */}
+                <button
+                  onClick={() => window.open("https://mmnext.services.ailifebot.com/", "_blank")}
+                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
+                  title={t("MMNext")}
+                >
+                  <img src={translatorLogo} alt="" className="h-4 w-4 shrink-0 object-contain" />
+                  <span>{t("MMNext")}</span>
+                </button>
+                <button
+                  onClick={() => window.open("https://talentai.motherson.com/", "_blank")}
+                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
+                  title={t("Talent AI")}
+                >
+                  <img src={translatorLogo} alt="" className="h-4 w-4 shrink-0 object-contain" />
+                  <span>{t("Talent AI")}</span>
+                </button>
+                <button
+                  onClick={() => window.open("https://genai.motherson.com/do33", "_blank")}
+                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
+                  title={t("DO33")}
+                >
+                  <img src={do33Logo} alt="" className="h-4 w-4 shrink-0 object-contain" />
+                  <span>{t("DO33")}</span>
+                </button>
+                <button
+                  onClick={() => window.open("https://translator.ai.motherson.com", "_blank")}
+                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
+                  title={t("AI Motherson Translator")}
+                >
+                  <img src={translatorLogo} alt="" className="h-4 w-4 shrink-0 object-contain" />
+                  <span>{t("AI Motherson Translator")}</span>
+                </button>
+                <button
+                  onClick={() => window.open("https://genai.motherson.com/capex-forecasting", "_blank")}
+                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
+                  title={t("Capex Forecasting")}
+                >
+                  <img src={translatorLogo} alt="" className="h-4 w-4 shrink-0 object-contain" />
+                  <span>{t("Capex Forecasting")}</span>
+                </button>
+                <button
+                  onClick={() => window.open("https://genai.motherson.com/yachiyo", "_blank")}
+                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
+                  title={t("Yachio Bot")}
+                >
+                  <img src={translatorLogo} alt="" className="h-4 w-4 shrink-0 object-contain" />
+                  <span>{t("Yachio Bot")}</span>
+                </button>
+                <button
+                  onClick={() => window.open("https://genai.motherson.com/kip", "_blank")}
+                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
+                  title={t("KIP Bot")}
+                >
+                  <img src={translatorLogo} alt="" className="h-4 w-4 shrink-0 object-contain" />
+                  <span>{t("KIP Bot")}</span>
+                </button>
+                <button
+                  onClick={() => window.open("https://spendanalytics-hmcqbkd4f6etbseu.centralindia-01.azurewebsites.net/", "_blank")}
+                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
+                  title={t("Spend Analytics")}
+                >
+                  <img src={translatorLogo} alt="" className="h-4 w-4 shrink-0 object-contain" />
+                  <span>{t("Spend Analytics")}</span>
+                </button>
+                <button
+                  onClick={() => window.open("https://mibuddy.motherson.com/", "_blank")}
+                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
+                  title={t("MiBuddy")}
+                >
+                  <img src={translatorLogo} alt="" className="h-4 w-4 shrink-0 object-contain" />
+                  <span>{t("MiBuddy")}</span>
                 </button>
               </div>
             </>
@@ -3183,7 +3278,7 @@ export default function AgentOrchestrator() {
           className="fixed z-[100] min-w-[200px] rounded-xl border border-border bg-popover p-1.5 shadow-lg"
           style={{ top: appsPopoverPos.top, left: appsPopoverPos.left }}
         >
-          <button
+          {/* <button
             onClick={() => { setShowAppsPopover(false); window.open("https://translator.motherson.com", "_blank"); }}
             className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
           >
@@ -3203,7 +3298,72 @@ export default function AgentOrchestrator() {
           >
             <img src={notebookLMLogo} alt="" className="h-5 w-5 shrink-0 object-contain" />
             <span>{t("NotebookLM")}</span>
+          </button> */}
+
+          <button
+            onClick={() => { setShowAppsPopover(false); window.open("https://mmnext.services.ailifebot.com/", "_blank"); }}
+            className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
+          >
+            <img src={translatorLogo} alt="" className="h-5 w-5 shrink-0 object-contain" />
+            <span>{t("MMNext")}</span>
           </button>
+          <button
+            onClick={() => { setShowAppsPopover(false); window.open("https://talentai.motherson.com/", "_blank"); }}
+            className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
+          >
+            <img src={translatorLogo} alt="" className="h-5 w-5 shrink-0 object-contain" />
+            <span>{t("Talent AI")}</span>
+          </button>
+          <button
+            onClick={() => { setShowAppsPopover(false); window.open("https://genai.motherson.com/do33", "_blank"); }}
+            className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
+          >
+            <img src={translatorLogo} alt="" className="h-5 w-5 shrink-0 object-contain" />
+            <span>{t("DO33")}</span>
+          </button>
+          <button
+            onClick={() => { setShowAppsPopover(false); window.open("https://translator.ai.motherson.com/", "_blank"); }}
+            className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
+          >
+            <img src={translatorLogo} alt="" className="h-5 w-5 shrink-0 object-contain" />
+            <span>{t("AI Motherson Translator")}</span>
+          </button>
+          <button
+            onClick={() => { setShowAppsPopover(false); window.open("https://genai.motherson.com/capex-forecasting", "_blank"); }}
+            className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
+          >
+            <img src={translatorLogo} alt="" className="h-5 w-5 shrink-0 object-contain" />
+            <span>{t("Capex Forecasting")}</span>
+          </button>
+          <button
+            onClick={() => { setShowAppsPopover(false); window.open("https://genai.motherson.com/yachiyo", "_blank"); }}
+            className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
+          >
+            <img src={translatorLogo} alt="" className="h-5 w-5 shrink-0 object-contain" />
+            <span>{t("Yachio Bot")}</span>
+          </button>
+          <button
+            onClick={() => { setShowAppsPopover(false); window.open("https://genai.motherson.com/kip", "_blank"); }}
+            className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
+          >
+            <img src={translatorLogo} alt="" className="h-5 w-5 shrink-0 object-contain" />
+            <span>{t("KIP Bot")}</span>
+          </button>
+          <button
+            onClick={() => { setShowAppsPopover(false); window.open("https://spendanalytics-hmcqbkd4f6etbseu.centralindia-01.azurewebsites.net/", "_blank"); }}
+            className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
+          >
+            <img src={translatorLogo} alt="" className="h-5 w-5 shrink-0 object-contain" />
+            <span>{t("Spend Analytics")}</span>
+          </button>
+          <button
+            onClick={() => { setShowAppsPopover(false); window.open("https://mibuddy.motherson.com/", "_blank"); }}
+            className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
+          >
+            <img src={translatorLogo} alt="" className="h-5 w-5 shrink-0 object-contain" />
+            <span>{t("MiBuddy")}</span>
+          </button>
+
         </div>
       )}
       {showAgentsPopover && (
