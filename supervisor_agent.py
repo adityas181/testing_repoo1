@@ -12,7 +12,12 @@ from agentcore.schema.data import Data
 from agentcore.schema.message import Message
 from agentcore.template.field.base import Output
 from agentcore.custom.custom_node.node import Node
-from agentcore.utils.constants import MESSAGE_SENDER_AI, MESSAGE_SENDER_NAME_AI
+from agentcore.utils.constants import (
+    MESSAGE_SENDER_AI,
+    MESSAGE_SENDER_NAME_AI,
+    MESSAGE_SENDER_NAME_USER,
+    MESSAGE_SENDER_USER,
+)
 
 
 class SupervisorAgent(Node):
@@ -646,7 +651,17 @@ Respond with ONLY a JSON array — no explanation, no markdown:
 
         # Override input_value with the task dispatched by the supervisor,
         # preserving any uploaded files so the worker LLM can see them.
-        task_message = Message(text=task, files=files_from_state or [])
+        # Set sender/sender_name explicitly so the Message has all required keys —
+        # without these, downstream ``to_lc_message()`` conversion logs
+        # ``Missing required keys ('text', 'sender') in Message, defaulting to
+        # HumanMessage.`` and an empty placeholder user row appears in the chat
+        # rendered as "No input message provided." on each worker invocation.
+        task_message = Message(
+            text=task,
+            sender=MESSAGE_SENDER_USER,
+            sender_name=MESSAGE_SENDER_NAME_USER,
+            files=files_from_state or [],
+        )
         vertex.update_raw_params({"input_value": task_message}, overwrite=True)
 
         # Reset built state so the vertex executes fresh on this hop.
