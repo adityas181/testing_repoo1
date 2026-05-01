@@ -62,6 +62,15 @@ import miChatHistoryIcon from "@/assets/mibuddy_chat_history.svg?url";
 import miArchiveIcon from "@/assets/mibuddy_archive.svg?url";
 import miInformationIcon from "@/assets/mibuddy_information.svg?url";
 import miHelpIcon from "@/assets/mibuddy_help.svg?url";
+import talentaiIcon from "@/assets/mothersonLogo.svg";
+import capexIcon from "@/assets/mothersonLogo.svg";
+import KIPIcon from "@/assets/mothersonLogo.svg";
+import yachioIcon from "@/assets/mothersonLogo.svg";
+import MMNextIcon from "@/assets/mothersonLogo.svg";
+import spendanalyticsIcon from "@/assets/mothersonLogo.svg";
+import MessagesPage from "../SettingsPage/pages/messagesPage";
+
+
 
 
 function SidebarMaskIcon({ src, className = "h-4 w-4 shrink-0" }: { src: string; className?: string }) {
@@ -2362,18 +2371,25 @@ export default function AgentOrchestrator() {
               setHeaderModelOverride(null);
             }
             let routedDisplayName: string | null = null;
+            // For image_gen routing, only update the message label (agentName) —
+            // do NOT switch the dropdown. Promoting selectedAiModel to nano-banana
+            // would auto-enable imageMode (see useEffect at ~line 1542) and force
+            // every followup through the image_mode fast-path on the backend, even
+            // for plain text questions. Users who want successive image generations
+            // can pick the image model explicitly via the dropdown or + → Create image.
+            const skipDropdownSwitch = routedMode === "image_gen";
             if (noAgentMode && data?.routed_model_id) {
               const routedId = String(data.routed_model_id);
               const match = aiModels.find((m) => m.id === routedId);
               if (match) {
                 routedDisplayName = match.name;
-                if (routedId !== selectedAiModel) setSelectedAiModel(routedId);
+                if (!skipDropdownSwitch && routedId !== selectedAiModel) setSelectedAiModel(routedId);
               }
             }
             if (!routedDisplayName && data?.routed_model_name) {
               const nameStr = String(data.routed_model_name);
               routedDisplayName = nameStr;
-              if (noAgentMode) {
+              if (noAgentMode && !skipDropdownSwitch) {
                 const byName = aiModels.find(
                   (m) => m.name.toLowerCase() === nameStr.toLowerCase(),
                 );
@@ -2505,30 +2521,45 @@ export default function AgentOrchestrator() {
             // to a different model than the one the user selected (e.g. user picked
             // "MiBuddy AI" → router picked "gpt-5.1-chat" → dropdown updates to
             // "gpt-5.1-chat" so the user knows subsequent messages will use it).
+            //
+            // Exception: don't promote to image-gen models. Doing so would auto-
+            // enable imageMode and force all followup messages through the
+            // image_mode fast-path on the backend, even plain-text queries.
+            const isImageModelName = (n: string) =>
+              /nano[\s_-]?banana|dall[\s_-]?e|flash[\s_-]?image|image[\s_-]?gen/i.test(n);
             if (noAgentMode && data?.routed_model_id) {
               const routedId = data.routed_model_id;
               if (routedId !== selectedAiModel) {
                 const match = aiModels.find((m) => m.id === routedId);
-                if (match) setSelectedAiModel(routedId);
+                if (match && !isImageModelName(match.name)) setSelectedAiModel(routedId);
               }
             } else if (noAgentMode && data?.routed_model_name) {
               // Fallback: match by display name if no id is present
+              const nameStr = String(data.routed_model_name);
               const byName = aiModels.find(
-                (m) => m.name.toLowerCase() === String(data.routed_model_name).toLowerCase(),
+                (m) => m.name.toLowerCase() === nameStr.toLowerCase(),
               );
-              if (byName && byName.id !== selectedAiModel) setSelectedAiModel(byName.id);
+              if (byName && byName.id !== selectedAiModel && !isImageModelName(byName.name)) {
+                setSelectedAiModel(byName.id);
+              }
             }
 
-            // Also auto-enable image mode if an image was returned
+            // Re-lock the dropdown to the image model only if the user was
+            // already on one (i.e. they explicitly picked Nano Banana or used
+            // + → Create image). For auto-routed image generations from a
+            // chat model like MiBuddy AI, leave the dropdown alone so the
+            // next message goes through normal intent classification.
             const finalText = data?.agent_text || "";
             const hasGeneratedImage = /!\[[^\]]*\]\([^)]+\)/.test(finalText);
             if (hasGeneratedImage && noAgentMode) {
-              const imageModel = aiModels.find((m) =>
-                /nano[\s_-]?banana|dall[\s_-]?e|flash[\s_-]?image|image[\s_-]?gen/i.test(m.name)
-              );
-              if (imageModel && imageModel.id !== selectedAiModel) {
-                setSelectedAiModel(imageModel.id);
-                // image_mode useEffect will auto-enable the chip
+              const currentModel = aiModels.find((m) => m.id === selectedAiModel);
+              const userOnImageModel = currentModel ? isImageModelName(currentModel.name) : false;
+              if (userOnImageModel) {
+                const imageModel = aiModels.find((m) => isImageModelName(m.name));
+                if (imageModel && imageModel.id !== selectedAiModel) {
+                  setSelectedAiModel(imageModel.id);
+                  // image_mode useEffect will auto-enable the chip
+                }
               }
             }
             // End event carries the final complete text — flush immediately.
@@ -3068,78 +3099,78 @@ export default function AgentOrchestrator() {
                   <span>{t("NotebookLM")}</span>
                 </button> */}
                 <button
-                  onClick={() => window.open("https://mmnext.services.ailifebot.com/", "_blank")}
-                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
-                  title={t("MMNext")}
-                >
-                  <img src={translatorLogo} alt="" className="h-4 w-4 shrink-0 object-contain" />
-                  <span>{t("MMNext")}</span>
-                </button>
-                <button
-                  onClick={() => window.open("https://talentai.motherson.com/", "_blank")}
-                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
-                  title={t("Talent AI")}
-                >
-                  <img src={translatorLogo} alt="" className="h-4 w-4 shrink-0 object-contain" />
-                  <span>{t("Talent AI")}</span>
-                </button>
-                <button
-                  onClick={() => window.open("https://genai.motherson.com/do33", "_blank")}
-                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
-                  title={t("DO33")}
-                >
-                  <img src={do33Logo} alt="" className="h-4 w-4 shrink-0 object-contain" />
-                  <span>{t("DO33")}</span>
-                </button>
-                <button
-                  onClick={() => window.open("https://translator.ai.motherson.com", "_blank")}
-                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
-                  title={t("AI Motherson Translator")}
-                >
-                  <img src={translatorLogo} alt="" className="h-4 w-4 shrink-0 object-contain" />
-                  <span>{t("AI Motherson Translator")}</span>
-                </button>
-                <button
-                  onClick={() => window.open("https://genai.motherson.com/capex-forecasting", "_blank")}
-                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
-                  title={t("Capex Forecasting")}
-                >
-                  <img src={translatorLogo} alt="" className="h-4 w-4 shrink-0 object-contain" />
-                  <span>{t("Capex Forecasting")}</span>
-                </button>
-                <button
-                  onClick={() => window.open("https://genai.motherson.com/yachiyo", "_blank")}
-                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
-                  title={t("Yachio Bot")}
-                >
-                  <img src={translatorLogo} alt="" className="h-4 w-4 shrink-0 object-contain" />
-                  <span>{t("Yachio Bot")}</span>
-                </button>
-                <button
-                  onClick={() => window.open("https://genai.motherson.com/kip", "_blank")}
-                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
-                  title={t("KIP Bot")}
-                >
-                  <img src={translatorLogo} alt="" className="h-4 w-4 shrink-0 object-contain" />
-                  <span>{t("KIP Bot")}</span>
-                </button>
-                <button
-                  onClick={() => window.open("https://spendanalytics-hmcqbkd4f6etbseu.centralindia-01.azurewebsites.net/", "_blank")}
-                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
-                  title={t("Spend Analytics")}
-                >
-                  <img src={translatorLogo} alt="" className="h-4 w-4 shrink-0 object-contain" />
-                  <span>{t("Spend Analytics")}</span>
-                </button>
-                <button
-                  onClick={() => window.open("https://mibuddy.motherson.com/", "_blank")}
-                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
-                  title={t("MiBuddy")}
-                >
-                  <img src={translatorLogo} alt="" className="h-4 w-4 shrink-0 object-contain" />
-                  <span>{t("MiBuddy")}</span>
-                </button>
-              </div>
+                                  onClick={() => window.open("https://mmnext.services.ailifebot.com/", "_blank")}
+                                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
+                                  title={t("MMNext")}
+                                >
+                                  <img src={MMNextIcon} alt="" className="h-4 w-4 shrink-0 object-contain" />
+                                  <span>{t("MMNext")}</span>
+                                </button>
+                                <button
+                                  onClick={() => window.open("https://talentai.motherson.com/", "_blank")}
+                                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
+                                  title={t("Talent AI")}
+                                >
+                                  <img src={talentaiIcon} alt="" className="h-4 w-4 shrink-0 object-contain" />
+                                  <span>{t("Talent AI")}</span>
+                                </button>
+                                <button
+                                  onClick={() => window.open("https://genai.motherson.com/do33", "_blank")}
+                                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
+                                  title={t("DO33")}
+                                >
+                                  <img src={do33Logo} alt="" className="h-4 w-4 shrink-0 object-contain" />
+                                  <span>{t("DO33")}</span>
+                                </button>
+                                <button
+                                  onClick={() => window.open("https://translator.ai.motherson.com", "_blank")}
+                                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
+                                  title={t("AI Motherson Translator")}
+                                >
+                                  <img src={translatorLogo} alt="" className="h-4 w-4 shrink-0 object-contain" />
+                                  <span>{t("AI Motherson Translator")}</span>
+                                </button>
+                                <button
+                                  onClick={() => window.open("https://genai.motherson.com/capex-forecasting", "_blank")}
+                                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
+                                  title={t("Capex Forecasting")}
+                                >
+                                  <img src={capexIcon} alt="" className="h-4 w-4 shrink-0 object-contain" />
+                                  <span>{t("Capex Forecasting")}</span>
+                                </button>
+                                <button
+                                  onClick={() => window.open("https://genai.motherson.com/yachiyo", "_blank")}
+                                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
+                                  title={t("Yachio Bot")}
+                                >
+                                  <img src={yachioIcon} alt="" className="h-4 w-4 shrink-0 object-contain" />
+                                  <span>{t("Yachio Bot")}</span>
+                                </button>
+                                <button
+                                  onClick={() => window.open("https://genai.motherson.com/kip", "_blank")}
+                                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
+                                  title={t("KIP Bot")}
+                                >
+                                  <img src={KIPIcon} alt="" className="h-4 w-4 shrink-0 object-contain" />
+                                  <span>{t("KIP Bot")}</span>
+                                </button>
+                                <button
+                                  onClick={() => window.open("https://spendanalytics-hmcqbkd4f6etbseu.centralindia-01.azurewebsites.net/", "_blank")}
+                                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
+                                  title={t("Spend Analytics")}
+                                >
+                                  <img src={spendanalyticsIcon} alt="" className="h-4 w-4 shrink-0 object-contain" />
+                                  <span>{t("Spend Analytics")}</span>
+                                </button>
+                                {/* <button
+                                  onClick={() => window.open("https://mibuddy.motherson.com/", "_blank")}
+                                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm text-foreground hover:bg-accent"
+                                  title={t("MiBuddy")}
+                                >
+                                  <img src={translatorLogo} alt="" className="h-4 w-4 shrink-0 object-contain" />
+                                  <span>{t("MiBuddy")}</span>
+                                </button> */}
+                              </div>
             </>
           ) : (
             <div data-apps-popover className="relative flex justify-center">
@@ -3220,8 +3251,11 @@ export default function AgentOrchestrator() {
             {t("Agents")}
           </div>
           <div className="px-2 pb-2">
-            <div className="flex flex-col gap-0.5">
-              {visibleAgents.map((agent) => (
+            <div
+                          className="flex max-h-[11.25rem] flex-col gap-0.5 overflow-y-auto scroll-smooth"
+                          style={{ scrollbarWidth: "thin" }}
+                        >
+                          {agents.map((agent) => (
                 <button
                   key={agent.id}
                   onClick={() => {
@@ -3231,6 +3265,7 @@ export default function AgentOrchestrator() {
                   className={`flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-[13px] text-foreground hover:bg-accent ${
                     selectedModelId === agent.id ? "bg-accent" : ""
                   }`}
+                  title={agent.name}
                 >
                   <span
                     className="h-2 w-2 shrink-0 rounded-full"
@@ -3301,68 +3336,68 @@ export default function AgentOrchestrator() {
           </button> */}
 
           <button
-            onClick={() => { setShowAppsPopover(false); window.open("https://mmnext.services.ailifebot.com/", "_blank"); }}
-            className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
-          >
-            <img src={translatorLogo} alt="" className="h-5 w-5 shrink-0 object-contain" />
-            <span>{t("MMNext")}</span>
-          </button>
-          <button
-            onClick={() => { setShowAppsPopover(false); window.open("https://talentai.motherson.com/", "_blank"); }}
-            className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
-          >
-            <img src={translatorLogo} alt="" className="h-5 w-5 shrink-0 object-contain" />
-            <span>{t("Talent AI")}</span>
-          </button>
-          <button
-            onClick={() => { setShowAppsPopover(false); window.open("https://genai.motherson.com/do33", "_blank"); }}
-            className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
-          >
-            <img src={translatorLogo} alt="" className="h-5 w-5 shrink-0 object-contain" />
-            <span>{t("DO33")}</span>
-          </button>
-          <button
-            onClick={() => { setShowAppsPopover(false); window.open("https://translator.ai.motherson.com/", "_blank"); }}
-            className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
-          >
-            <img src={translatorLogo} alt="" className="h-5 w-5 shrink-0 object-contain" />
-            <span>{t("AI Motherson Translator")}</span>
-          </button>
-          <button
-            onClick={() => { setShowAppsPopover(false); window.open("https://genai.motherson.com/capex-forecasting", "_blank"); }}
-            className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
-          >
-            <img src={translatorLogo} alt="" className="h-5 w-5 shrink-0 object-contain" />
-            <span>{t("Capex Forecasting")}</span>
-          </button>
-          <button
-            onClick={() => { setShowAppsPopover(false); window.open("https://genai.motherson.com/yachiyo", "_blank"); }}
-            className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
-          >
-            <img src={translatorLogo} alt="" className="h-5 w-5 shrink-0 object-contain" />
-            <span>{t("Yachio Bot")}</span>
-          </button>
-          <button
-            onClick={() => { setShowAppsPopover(false); window.open("https://genai.motherson.com/kip", "_blank"); }}
-            className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
-          >
-            <img src={translatorLogo} alt="" className="h-5 w-5 shrink-0 object-contain" />
-            <span>{t("KIP Bot")}</span>
-          </button>
-          <button
-            onClick={() => { setShowAppsPopover(false); window.open("https://spendanalytics-hmcqbkd4f6etbseu.centralindia-01.azurewebsites.net/", "_blank"); }}
-            className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
-          >
-            <img src={translatorLogo} alt="" className="h-5 w-5 shrink-0 object-contain" />
-            <span>{t("Spend Analytics")}</span>
-          </button>
-          <button
-            onClick={() => { setShowAppsPopover(false); window.open("https://mibuddy.motherson.com/", "_blank"); }}
-            className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
-          >
-            <img src={translatorLogo} alt="" className="h-5 w-5 shrink-0 object-contain" />
-            <span>{t("MiBuddy")}</span>
-          </button>
+                      onClick={() => { setShowAppsPopover(false); window.open("https://mmnext.services.ailifebot.com/", "_blank"); }}
+                      className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
+                    >
+                      <img src={MMNextIcon} alt="" className="h-5 w-5 shrink-0 object-contain" />
+                      <span>{t("MMNext")}</span>
+                    </button>
+                    <button
+                      onClick={() => { setShowAppsPopover(false); window.open("https://talentai.motherson.com/", "_blank"); }}
+                      className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
+                    >
+                      <img src={talentaiIcon} alt="" className="h-5 w-5 shrink-0 object-contain" />
+                      <span>{t("Talent AI")}</span>
+                    </button>
+                    <button
+                      onClick={() => { setShowAppsPopover(false); window.open("https://genai.motherson.com/do33", "_blank"); }}
+                      className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
+                    >
+                      <img src={translatorLogo} alt="" className="h-5 w-5 shrink-0 object-contain" />
+                      <span>{t("DO33")}</span>
+                    </button>
+                    <button
+                      onClick={() => { setShowAppsPopover(false); window.open("https://translator.ai.motherson.com/", "_blank"); }}
+                      className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
+                    >
+                      <img src={translatorLogo} alt="" className="h-5 w-5 shrink-0 object-contain" />
+                      <span>{t("AI Motherson Translator")}</span>
+                    </button>
+                    <button
+                      onClick={() => { setShowAppsPopover(false); window.open("https://genai.motherson.com/capex-forecasting", "_blank"); }}
+                      className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
+                    >
+                      <img src={capexIcon} alt="" className="h-5 w-5 shrink-0 object-contain" />
+                      <span>{t("Capex Forecasting")}</span>
+                    </button>
+                    <button
+                      onClick={() => { setShowAppsPopover(false); window.open("https://genai.motherson.com/yachiyo", "_blank"); }}
+                      className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
+                    >
+                      <img src={yachioIcon} alt="" className="h-5 w-5 shrink-0 object-contain" />
+                      <span>{t("Yachio Bot")}</span>
+                    </button>
+                    <button
+                      onClick={() => { setShowAppsPopover(false); window.open("https://genai.motherson.com/kip", "_blank"); }}
+                      className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
+                    >
+                      <img src={KIPIcon} alt="" className="h-5 w-5 shrink-0 object-contain" />
+                      <span>{t("KIP Bot")}</span>
+                    </button>
+                    <button
+                      onClick={() => { setShowAppsPopover(false); window.open("https://spendanalytics-hmcqbkd4f6etbseu.centralindia-01.azurewebsites.net/", "_blank"); }}
+                      className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
+                    >
+                      <img src={spendanalyticsIcon} alt="" className="h-5 w-5 shrink-0 object-contain" />
+                      <span>{t("Spend Analytics")}</span>
+                    </button>
+                    {/* <button
+                      onClick={() => { setShowAppsPopover(false); window.open("https://mibuddy.motherson.com/", "_blank"); }}
+                      className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm text-foreground hover:bg-accent"
+                    >
+                      <img src={translatorLogo} alt="" className="h-5 w-5 shrink-0 object-contain" />
+                      <span>{t("MiBuddy")}</span>
+                    </button> */}
 
         </div>
       )}
@@ -4637,7 +4672,9 @@ export default function AgentOrchestrator() {
                           ? t("Waiting for human review — approve or reject to continue")
                           : isSending
                             ? t("Waiting for response...")
-                            : t("Start typing with @ to chat with an agent")
+                            : noAgentMode && messages.length > 0
+                              ? t("Start typing to chat with the Model")
+                              : t("Start typing with @ to chat with an agent")
                   }
                   rows={1}
                   style={{ maxHeight: TEXTAREA_MAX_HEIGHT }}
