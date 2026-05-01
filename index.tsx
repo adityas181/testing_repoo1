@@ -1277,7 +1277,39 @@ export default function AgentOrchestrator() {
         if (hint?.mode === "model") {
           setSelectedModelId("");
           setNoAgentMode(true);
-          setSelectedAiModel(hint.modelId);
+          // Don't restore the dropdown to an image-gen model. After auto-
+          // routing (MiBuddy AI → Nano Banana for "draw a dog"), the latest
+          // message's model_id is Nano Banana — restoring that would auto-
+          // enable imageMode and force every followup through the image_mode
+          // fast-path. Walk back to the most recent non-image model in the
+          // session, or fall back to MiBuddy AI / the page default.
+          const isImageModelName = (n: string) =>
+            /nano[\s_-]?banana|dall[\s_-]?e|flash[\s_-]?image|image[\s_-]?gen/i.test(n);
+          const hintedModel = aiModels.find((m) => m.id === hint.modelId);
+          let resolvedModelId = hint.modelId;
+          if (hintedModel && isImageModelName(hintedModel.name)) {
+            let found: string | null = null;
+            for (let i = apiSessionMessages.length - 1; i >= 0; i -= 1) {
+              const mid = (apiSessionMessages[i] as any)?.model_id;
+              if (!mid || mid === hint.modelId) continue;
+              const m = aiModels.find((mm) => mm.id === mid);
+              if (m && !isImageModelName(m.name)) {
+                found = mid;
+                break;
+              }
+            }
+            if (found) {
+              resolvedModelId = found;
+            } else {
+              const mibuddy = aiModels.find((m) => /mibuddy[\s_-]?ai/i.test(m.name));
+              const fallback =
+                mibuddy ||
+                aiModels.find((m) => m.is_default && !isImageModelName(m.name)) ||
+                aiModels.find((m) => !isImageModelName(m.name));
+              if (fallback) resolvedModelId = fallback.id;
+            }
+          }
+          setSelectedAiModel(resolvedModelId);
           setHeaderModelOverride(null);
           sessionSelectionSyncRef.current = effectiveSessionId;
           return;
@@ -2544,21 +2576,27 @@ export default function AgentOrchestrator() {
               }
             }
 
-            // Re-lock the dropdown to the image model only if the user was
-            // already on one (i.e. they explicitly picked Nano Banana or used
-            // + → Create image). For auto-routed image generations from a
-            // chat model like MiBuddy AI, leave the dropdown alone so the
-            // next message goes through normal intent classification.
+            // After a successful image generation, always revert the dropdown
+            // back to MiBuddy AI (or the default chat model) so the next
+            // message goes through normal intent classification. Applies to
+            // both auto-routed image gens (MiBuddy AI → Nano Banana for one
+            // turn) and explicit image-model picks — users who want
+            // successive images can re-select Nano Banana or use + → Create
+            // image. The imageMode useEffect will auto-clear the red chip
+            // when the dropdown leaves the image model.
             const finalText = data?.agent_text || "";
             const hasGeneratedImage = /!\[[^\]]*\]\([^)]+\)/.test(finalText);
             if (hasGeneratedImage && noAgentMode) {
               const currentModel = aiModels.find((m) => m.id === selectedAiModel);
               const userOnImageModel = currentModel ? isImageModelName(currentModel.name) : false;
               if (userOnImageModel) {
-                const imageModel = aiModels.find((m) => isImageModelName(m.name));
-                if (imageModel && imageModel.id !== selectedAiModel) {
-                  setSelectedAiModel(imageModel.id);
-                  // image_mode useEffect will auto-enable the chip
+                const mibuddy = aiModels.find((m) => /mibuddy[\s_-]?ai/i.test(m.name));
+                const fallback =
+                  mibuddy ||
+                  aiModels.find((m) => m.is_default && !isImageModelName(m.name)) ||
+                  aiModels.find((m) => !isImageModelName(m.name));
+                if (fallback && fallback.id !== selectedAiModel) {
+                  setSelectedAiModel(fallback.id);
                 }
               }
             }
