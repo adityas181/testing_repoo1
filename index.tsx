@@ -792,12 +792,11 @@ function ThinkingIndicator({
     ];
     const idx = Math.floor(elapsed / PHRASE_DWELL_MS) % phrases.length;
     label = phrases[idx];
-  } else if (!routedMode) {
-    // Pre-routing gap: backend hasn't decided which mode yet.
-    label = t("Understanding your request");
   } else {
-    // routedMode === "chat" or anything else
+    // No routing decision (covers agents — which never emit a routing event —
+    // and the pre-routing gap for models). Also catches routedMode === "chat".
     const phrases = [
+      t("Reading your message"),
       t("Thinking"),
       t("Drafting a reply"),
     ];
@@ -2217,7 +2216,13 @@ export default function AgentOrchestrator() {
 
     // 2. Call PUT endpoint to do the in-place update on the backend
     try {
+      // Mark THIS session as sending so isSendingThisSession (and therefore
+      // ThinkingIndicator) becomes true while the edit's PUT is in flight.
+      // Without sendingSessionId, the optimistically-cleared agent bubble
+      // would render "Message empty." via MarkdownField's empty fallback.
       setIsSending(true);
+      setSendingSessionId(currentSessionId);
+      setRoutedMode(null);
       const headers: Record<string, string> = { "Content-Type": "application/json" };
       const tokenMatch = document.cookie.match(/(?:^|;\s*)access_token_ag=([^;]*)/);
       if (tokenMatch?.[1]) headers["Authorization"] = `Bearer ${decodeURIComponent(tokenMatch[1])}`;
@@ -2279,6 +2284,8 @@ export default function AgentOrchestrator() {
       });
     } finally {
       setIsSending(false);
+      setSendingSessionId(null);
+      setRoutedMode(null);
     }
   }, [editDraft, editingMsgId, cotReasoning, imageMode]);
 
@@ -4269,9 +4276,17 @@ export default function AgentOrchestrator() {
               // tool calls), render the body so the streaming UX is visible.
               const hasContentBlocks = !!(msg.contentBlocks && msg.contentBlocks.length > 0);
               const hasReasoning = !!(msg.reasoningContent && msg.reasoningContent.length > 0);
+              // Image-gen path: backend streams "Generating image..." as a token
+              // BEFORE the actual image markdown arrives. Without this carve-out,
+              // that placeholder text would unmount the ThinkingIndicator (and its
+              // image skeleton) the instant streaming begins. Keep showing the
+              // indicator until real image markdown ("![...](...)") appears.
+              const hasImageMarkdown = !!msg.content && msg.content.includes("![");
+              const isImageGenStreaming =
+                routedMode === "image_gen" && !hasImageMarkdown;
               const isThinking =
                 msg.sender === "agent" &&
-                msg.content === "" &&
+                (msg.content === "" || isImageGenStreaming) &&
                 !hasContentBlocks &&
                 !hasReasoning &&
                 isSendingThisSession;

@@ -767,7 +767,22 @@ async def _orch_call_run_api(
                         f"content_blocks={len(end_content_blocks)}"
                     )
                 elif etype == "error":
-                    raise ValueError(edata.get("error", "Stream error from /run"))
+                    # The run-API emits two flavors of `error` events:
+                    #   1. Component-level ErrorMessage sent via send_error()
+                    #      — payload has `text="<msg>"` plus `error=True`
+                    #        (a boolean flag from MessageEvent), and
+                    #   2. run_agent_generator's terminal error
+                    #      — payload has `error="<msg>"` (string).
+                    # Picking the literal "error" key first turns the boolean
+                    # into the user-visible string "False". Prefer `text`,
+                    # fall back to `error` only if it is a non-empty string.
+                    err_msg: Any = edata.get("text") if isinstance(edata, dict) else None
+                    if not (isinstance(err_msg, str) and err_msg.strip()):
+                        candidate = edata.get("error") if isinstance(edata, dict) else None
+                        err_msg = candidate if isinstance(candidate, str) and candidate.strip() else None
+                    if not (isinstance(err_msg, str) and err_msg.strip()):
+                        err_msg = "Stream error from /run"
+                    raise ValueError(err_msg)
 
     reconstructed_text = _reconstructed_stream_text()
     if not was_interrupted:
@@ -1216,7 +1231,48 @@ async def _route_request(
     """
     from agentcore.services.mibuddy.document_extractor import IMAGE_EXTENSIONS, SUPPORTED_DOC_EXTENSIONS
 
-    # Priority 0: Document files attached → document_qa mode (highest priority)
+    # Priority 0: Explicit @agent mention wins over everything else, including
+    # attached files. The agent's own ChatInput → resolve_attachments path
+    # handles file extraction, so we must NOT short-circuit into document_qa.
+    # (Previously document_qa had Priority 0 and beat @agent, which made
+    # @AgentName + file upload always land in MiBuddy's RAG flow.)
+    if body.agent_id or body.deployment_id:
+        agent_id, deployment_id, deployment = await _resolve_agent(session, current_user, body)
+        return {
+            "mode": "agent",
+            "agent_id": agent_id,
+            "deployment_id": deployment_id,
+            "deployment": deployment,
+            "model_id": None,
+            "intent": None,
+        }
+
+    # Priority 0.5: Sticky session continuation. If this session was already
+    # bound to an agent (i.e. a previous turn @-mentioned one and it ran),
+    # follow-ups stay with that agent — including follow-ups that attach
+    # files. Without this, message 2 in an agent session would silently fall
+    # into document_qa just because the user re-attached a doc.
+    # Fresh sessions (no prior agent run) are NOT caught here and continue
+    # to document_qa / intent classification below — that's intended.
+    sticky_active = await orch_get_active_agent(session, body.session_id)
+    if sticky_active:
+        sticky_deployment = await session.get(AgentDeploymentProd, sticky_active["deployment_id"])
+        if not sticky_deployment:
+            sticky_deployment = await session.get(AgentDeploymentUAT, sticky_active["deployment_id"])
+        if sticky_deployment and await _user_can_access_deployment(
+            session, current_user, sticky_deployment
+        ):
+            return {
+                "mode": "agent",
+                "agent_id": sticky_active["agent_id"],
+                "deployment_id": sticky_active["deployment_id"],
+                "deployment": sticky_deployment,
+                "model_id": None,
+                "intent": None,
+            }
+
+    # Priority 1: No @agent and no sticky agent, but document files attached
+    # → document_qa mode (fresh-session RAG flow, unchanged).
     if body.files:
         doc_files = [
             f for f in body.files
@@ -1257,18 +1313,6 @@ async def _route_request(
     # The dispatch-side "settings override" (web_search_model_name /
     # image_gen_model_name) swaps the responding model to the configured
     # specialist when the intent doesn't match the selected model.
-
-    # Mode 1: Explicit @agent mention
-    if body.agent_id or body.deployment_id:
-        agent_id, deployment_id, deployment = await _resolve_agent(session, current_user, body)
-        return {
-            "mode": "agent",
-            "agent_id": agent_id,
-            "deployment_id": deployment_id,
-            "deployment": deployment,
-            "model_id": None,
-            "intent": None,
-        }
 
     # Fast path: explicit image_mode flag from frontend — skip intent classification.
     # When the user has picked a specific image model (body.model_id set), mark
@@ -1697,10 +1741,14 @@ async def orch_chat(
             # `is_canvas_enabled` to True for compose/reply intents —
             # we bubble that back to the frontend as `auto_canvas`.
             from agentcore.services.mibuddy.outlook_agent import outlook_agent_node
+            from agentcore.api.outlook_orch import get_outlook_token_from_request
             state = {
                 "messages": [{"role": "user", "content": body.input_value}],
                 "user_id": str(current_user.id),
                 "is_canvas_enabled": bool(body.canvas_enabled),
+                # Pass the token from the cookie so any pod can serve the
+                # request, not just the pod that handled the OAuth callback.
+                "access_token": get_outlook_token_from_request(request),
             }
             state = await outlook_agent_node(state)
             response_text = state.get("final_response", "") or (
@@ -2079,10 +2127,12 @@ async def orch_chat_stream(
                     # chunk + an end event, matching other non-streaming
                     # modes like kb_search.
                     from agentcore.services.mibuddy.outlook_agent import outlook_agent_node
+                    from agentcore.api.outlook_orch import get_outlook_token_from_request
                     state = {
                         "messages": [{"role": "user", "content": _input_value}],
                         "user_id": str(_user_id),
                         "is_canvas_enabled": _canvas_enabled,
+                        "access_token": get_outlook_token_from_request(request),
                     }
                     state = await outlook_agent_node(state)
                     outlook_text = state.get("final_response", "") or (
@@ -2347,8 +2397,45 @@ async def orch_chat_stream(
             })
         except Exception as exc:
             logger.exception(f"[ORCH-STREAM] Error: {exc}")
-            event_manager.on_error(data={"text": str(exc)})
-            event_manager.on_end(data={})
+            # Surface the agent failure to the user the same way Playground
+            # does: persist a visible agent message carrying the error text
+            # and close the stream via `end` with `agent_text` populated.
+            # Relying on the `error` SSE event alone leaves the placeholder
+            # bubble empty — the frontend then falls back to rendering
+            # EMPTY_OUTPUT_SEND_MESSAGE ("Message empty.").
+            error_text = str(exc) or "Agent run failed."
+            from agentcore.services.deps import session_scope
+
+            err_msg_id = uuid4()
+            try:
+                err_ts = datetime.now(timezone.utc).replace(tzinfo=None)
+                async with session_scope() as db:
+                    err_agent_msg = OrchConversationTable(
+                        id=err_msg_id,
+                        sender="agent",
+                        sender_name=agent_name,
+                        session_id=chat_session_id,
+                        text=error_text,
+                        agent_id=dep_agent_id,
+                        user_id=dep_user_id,
+                        deployment_id=dep_deployment_id,
+                        timestamp=err_ts,
+                        files=[],
+                        properties={"error": True},
+                        category="error",
+                        content_blocks=[],
+                    )
+                    await orch_add_message(err_agent_msg, db)
+            except Exception as _persist_err:
+                logger.warning(f"[ORCH-STREAM] Could not persist error message: {_persist_err}")
+
+            event_manager.on_error(data={"text": error_text})
+            event_manager.on_end(data={
+                "agent_text": error_text,
+                "message_id": str(err_msg_id),
+                "content_blocks": [],
+                "error": True,
+            })
         finally:
             # Sentinel to stop the consumer
             queue.put_nowait((None, None, None))
@@ -2510,6 +2597,7 @@ async def get_orch_session_messages(
 )
 async def edit_orch_message(
     *,
+    request: Request,
     session: DbSession,
     current_user: CurrentActiveUser,
     message_id: str,
@@ -2719,10 +2807,12 @@ async def edit_orch_message(
 
         elif mode == "outlook_query":
             from agentcore.services.mibuddy.outlook_agent import outlook_agent_node
+            from agentcore.api.outlook_orch import get_outlook_token_from_request
             state = {
                 "messages": [{"role": "user", "content": body.edited_text}],
                 "user_id": str(current_user.id),
                 "is_canvas_enabled": False,
+                "access_token": get_outlook_token_from_request(request),
             }
             state = await outlook_agent_node(state)
             new_response_text = state.get("final_response", "") or (
