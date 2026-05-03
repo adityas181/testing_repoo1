@@ -3683,22 +3683,61 @@ export default function AgentOrchestrator() {
             // Restrict COT to Gemini models only (the only provider with reliable
             // visible thinking support in our current setup). Matches names like
             // "Gemini 3 Pro", "gemini-3.1-pro-preview", "Google 3.1 Pro", "Gemini 2.5 Flash".
-            const modelName = `${selectedModel?.name || ""}`.toLowerCase();
-            const isGeminiModel = /\b(gemini|google)\b/.test(modelName) && /\b(2\.5|3|3\.\d+)\b/.test(modelName);
-            const cotDisabled = noAgentMode && !isGeminiModel;
+            const isGeminiName = (n: string) => {
+              const ln = (n || "").toLowerCase();
+              return /\b(gemini|google)\b/.test(ln) && /\b(2\.5|3|3\.\d+)\b/.test(ln);
+            };
+            const isGeminiModel = isGeminiName(selectedModel?.name || "");
+            // Find the best Gemini reasoning model in the registry — Option A:
+            // Pro + is_default → Pro → default → first available.
+            const geminiCandidates = aiModels.filter((m) => isGeminiName(m.name));
+            const bestGemini =
+              geminiCandidates.find((m) => /\bpro\b/i.test(m.name) && m.is_default) ||
+              geminiCandidates.find((m) => /\bpro\b/i.test(m.name)) ||
+              geminiCandidates.find((m) => m.is_default) ||
+              geminiCandidates[0] ||
+              null;
+            // Disabled only if not in model mode, or no Gemini model exists
+            // in the registry to switch to. Otherwise the button is always
+            // clickable: toggling on auto-switches to the best Gemini, mirror-
+            // ing how "Create image" auto-switches to an image-gen model.
+            const cotDisabled = !noAgentMode || !bestGemini;
+            const willAutoSwitch = !cotDisabled && !cotReasoning && !isGeminiModel && !!bestGemini;
             return (
           <button
-            onClick={() => { if (!cotDisabled) setCotReasoning(!cotReasoning); }}
+            onClick={() => {
+              if (cotDisabled) return;
+              const turningOn = !cotReasoning;
+              if (turningOn && !isGeminiModel && bestGemini) {
+                // Switch to a reasoning-capable Gemini first, then enable COT.
+                setSelectedAiModel(bestGemini.id);
+                setNoAgentMode(true);
+              }
+              setCotReasoning(turningOn);
+            }}
             className={`flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-left text-sm ${
               cotDisabled ? "cursor-not-allowed text-muted-foreground/50" : "text-foreground hover:bg-accent"
             }`}
-            title={cotDisabled ? "Selected model does not support reasoning" : undefined}
+            title={
+              cotDisabled
+                ? (!noAgentMode
+                    ? "COT reasoning is only available in model (No Agent) mode"
+                    : "No Gemini reasoning model is registered")
+                : willAutoSwitch && bestGemini
+                  ? `Will switch to ${bestGemini.name} (Gemini reasoning)`
+                  : undefined
+            }
           >
             <div className="flex items-center gap-3">
               <Lightbulb size={16} className={cotDisabled ? "text-muted-foreground/30" : "text-muted-foreground"} />
               <span>{t("COT reasoning")}</span>
-              {cotDisabled && noAgentMode && selectedModel && (
-                <span className="text-xxs text-muted-foreground/50">({t("not supported")})</span>
+              {willAutoSwitch && bestGemini && (
+                <span className="text-xxs text-muted-foreground/70">
+                  ({t("switches to")} {bestGemini.name})
+                </span>
+              )}
+              {cotDisabled && noAgentMode && (
+                <span className="text-xxs text-muted-foreground/50">({t("no Gemini model")})</span>
               )}
             </div>
             <div
@@ -4179,14 +4218,17 @@ export default function AgentOrchestrator() {
 
               const isUser = msg.sender === "user";
               // Show ThinkingIndicator only when there is NOTHING to display yet —
-              // no text content AND no tool-call cards. Once content_blocks arrive
-              // (e.g. "Invoking calculator..."), surface those instead so the user
-              // can see real backend activity during the tool-call wait.
+              // no text content, no tool-call cards, and no reasoning tokens yet.
+              // Once any of those arrive (Gemini/Anthropic emit reasoning before
+              // the user-facing answer; tool agents emit content_blocks during
+              // tool calls), render the body so the streaming UX is visible.
               const hasContentBlocks = !!(msg.contentBlocks && msg.contentBlocks.length > 0);
+              const hasReasoning = !!(msg.reasoningContent && msg.reasoningContent.length > 0);
               const isThinking =
                 msg.sender === "agent" &&
                 msg.content === "" &&
                 !hasContentBlocks &&
+                !hasReasoning &&
                 isSendingThisSession;
               const isInlineEditingUserMessage =
                 isUser && editingMsgId === msg.id && noAgentMode;
@@ -4414,13 +4456,14 @@ export default function AgentOrchestrator() {
                               );
                             }}
                           />
-                        ) : msg.content || !hasContentBlocks ? (
+                        ) : msg.content || (!hasContentBlocks && !hasReasoning) ? (
                           // Render the markdown body if there is text to show, or
-                          // (as a fallback) when there are no tool cards either —
-                          // that fallback case is what the "Message empty." string
-                          // covers. While tool blocks are streaming with no text
-                          // yet, render nothing so the empty placeholder doesn't
-                          // flash between the tool card and the first token.
+                          // (as a fallback) when there are no tool cards AND no
+                          // reasoning panel either — that fallback case is what
+                          // the "Message empty." string covers. While tool blocks
+                          // or reasoning are streaming with no answer text yet,
+                          // render nothing so the empty placeholder doesn't flash
+                          // between them and the first answer token.
                           <MarkdownField
                             chat={{}}
                             isEmpty={!msg.content}
