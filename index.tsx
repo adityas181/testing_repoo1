@@ -2251,10 +2251,30 @@ export default function AgentOrchestrator() {
             return { ...m, content: data.user_message.text };
           }
           if (data.agent_message && m.id === data.agent_message.id) {
+            // Filter content_blocks the same way the initial-fetch path does
+            // (line ~281) — only keep tool-call blocks; the rest is noise.
+            const rawBlocks = (data.agent_message.content_blocks ?? []) as any[];
+            const toolBlocks = rawBlocks.filter((block: any) =>
+              block?.contents?.some((c: any) =>
+                ["tool_use", "tool_result", "media", "code"].includes(c?.type),
+              ),
+            );
             return {
               ...m,
               content: data.agent_message.text,
               reasoningContent: data.agent_message.reasoning_content || undefined,
+              // Sync server-side block state — image-gen edits keep this
+              // empty, but mode-flip edits (e.g. agent → model_direct) need
+              // the old tool cards cleared. Without this, the optimistic
+              // `undefined` would be the only thing keeping stale tool
+              // cards from re-appearing on the next React reconciliation.
+              contentBlocks: toolBlocks.length > 0 ? toolBlocks : undefined,
+              // Sync files so newly-attached images on a regenerated reply
+              // (or cleared files when the mode flips away from image_gen)
+              // are reflected without a page reload.
+              files: data.agent_message.files && data.agent_message.files.length > 0
+                ? data.agent_message.files
+                : undefined,
               agentName: data.agent_message.sender_name,
             };
           }

@@ -2907,6 +2907,18 @@ async def edit_orch_message(
                 agent_msg.model_id = resp_model_id
             if hasattr(agent_msg, "reasoning_content"):
                 agent_msg.reasoning_content = new_reasoning
+            # Clear stale files/content_blocks from the original response.
+            # Without this, a refetch (page reload) would still see the OLD
+            # tool cards or attached files alongside the regenerated text —
+            # e.g. a Nano Banana edit kept the original tool-call blocks
+            # from a prior agent answer, and a mode flip from agent →
+            # image_gen left orphan content_blocks pointing at stale data.
+            # The non-streaming handlers (handle_image_generation,
+            # handle_web_search, etc.) embed their output entirely in
+            # response_text, so resetting these to empty matches what the
+            # streaming-flow persistence does for the same modes.
+            agent_msg.files = []
+            agent_msg.content_blocks = []
             session.add(agent_msg)
         else:
             # Edge case: user edited a message that had no response yet.
