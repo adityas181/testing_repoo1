@@ -2198,38 +2198,55 @@ export default function AgentOrchestrator() {
 
     // 1. Optimistic update: set user msg text to edited value, mark agent msg
     // as "thinking" (empty content) and truncate anything after the pair.
+    // flushSync runs the updater synchronously so editingAgentMsgId is
+    // populated before the setStreamingMsgId call below — without flushSync,
+    // React would defer the updater to render time and the closure variable
+    // would still be null.
     let editingAgentMsgId: string | null = null;
-    setMessages((prev) => {
-      const userIdx = prev.findIndex((m) => m.id === msgIdBeingEdited);
-      if (userIdx === -1) return prev;
-      // Find the next agent message AFTER this user msg
-      let agentIdx = -1;
-      for (let i = userIdx + 1; i < prev.length; i++) {
-        if (prev[i].sender === "agent") {
-          agentIdx = i;
-          break;
+    let priorWasImage = false;
+    flushSync(() => {
+      setMessages((prev) => {
+        const userIdx = prev.findIndex((m) => m.id === msgIdBeingEdited);
+        if (userIdx === -1) return prev;
+        // Find the next agent message AFTER this user msg
+        let agentIdx = -1;
+        for (let i = userIdx + 1; i < prev.length; i++) {
+          if (prev[i].sender === "agent") {
+            agentIdx = i;
+            break;
+          }
         }
-      }
-      const truncateAt = agentIdx === -1 ? userIdx + 1 : agentIdx + 1;
-      const updated = [...prev.slice(0, truncateAt)];
-      // Update user message content
-      updated[userIdx] = { ...updated[userIdx], content: text };
-      // Reset agent response to empty to show "Thinking..." state (if it exists)
-      if (agentIdx !== -1) {
-        editingAgentMsgId = updated[agentIdx].id;
-        updated[agentIdx] = {
-          ...updated[agentIdx],
-          content: "",
-          reasoningContent: undefined,
-          contentBlocks: undefined,
-        };
-      }
-      return updated;
+        const truncateAt = agentIdx === -1 ? userIdx + 1 : agentIdx + 1;
+        const updated = [...prev.slice(0, truncateAt)];
+        // Update user message content
+        updated[userIdx] = { ...updated[userIdx], content: text };
+        // Reset agent response to empty to show "Thinking..." state (if it exists)
+        if (agentIdx !== -1) {
+          editingAgentMsgId = updated[agentIdx].id;
+          // Detect whether this was an image-gen reply so the ThinkingIndicator
+          // can show the image skeleton (square placeholder + "Generating image"
+          // phrases) during the regenerate, instead of the generic text bars.
+          priorWasImage = !!updated[agentIdx].content?.includes("![");
+          updated[agentIdx] = {
+            ...updated[agentIdx],
+            content: "",
+            reasoningContent: undefined,
+            contentBlocks: undefined,
+          };
+        }
+        return updated;
+      });
     });
     // Scope the ThinkingIndicator to this exact agent bubble. Without this,
     // the render-loop's `msg.id === streamingMsgId` guard would fail and the
     // empty bubble would render the "Message empty." fallback.
     if (editingAgentMsgId) setStreamingMsgId(editingAgentMsgId);
+    // Pre-seed routedMode so the indicator matches the prior reply's modality.
+    // For image edits this surfaces the image skeleton immediately, instead
+    // of the generic text-bar one until (or if) the backend re-emits a
+    // routing event. For non-image edits, clear stale routedMode from prior
+    // turns so we fall back to the generic skeleton.
+    setRoutedMode(priorWasImage ? "image_gen" : null);
 
     // 2. Call PUT endpoint to do the in-place update on the backend
     try {
@@ -2239,7 +2256,8 @@ export default function AgentOrchestrator() {
       // would render "Message empty." via MarkdownField's empty fallback.
       setIsSending(true);
       setSendingSessionId(currentSessionId);
-      setRoutedMode(null);
+      // routedMode was pre-seeded above based on the prior reply's modality;
+      // don't overwrite it here.
       const headers: Record<string, string> = { "Content-Type": "application/json" };
       const tokenMatch = document.cookie.match(/(?:^|;\s*)access_token_ag=([^;]*)/);
       if (tokenMatch?.[1]) headers["Authorization"] = `Bearer ${decodeURIComponent(tokenMatch[1])}`;
