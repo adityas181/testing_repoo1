@@ -1105,6 +1105,15 @@ export default function AgentOrchestrator() {
   const aiModelPickerRef = useRef<HTMLDivElement>(null);
   const hitlSessionRef = useRef<string | null>(null);
   const sessionSelectionSyncRef = useRef<string | null>(null);
+  // Tracks message IDs that were just regenerated via the edit endpoint, with
+  // the wall-clock time of the edit. The polling-refetch merge prefers API
+  // content over local when local isn't longer (see merge useEffect) — fine
+  // for text edits, but for image edits the new and old URLs have identical
+  // length, so the heuristic falls through and a stale read-replica response
+  // can briefly clobber the just-applied new image. While an ID lives in this
+  // ref we keep local content during the merge.
+  const recentlyEditedRef = useRef<Map<string, number>>(new Map());
+  const RECENT_EDIT_TTL_MS = 30_000;
 
   /* ------------------ FILE UPLOAD ------------------ */
 
@@ -1386,8 +1395,21 @@ export default function AgentOrchestrator() {
             // commit, etc). Only override when local clearly has more text.
             const apiContent = (merged.content as string | undefined) || "";
             const localContent = (local.content as string | undefined) || "";
+            // Image-edit grace period: the length heuristic below can't tell
+            // a new vs old image URL apart (same format → same length), so a
+            // stale polling read can clobber the just-applied new image. If
+            // this id was edited within the TTL, keep the authoritative
+            // local content.
+            const editedAt = recentlyEditedRef.current.get(m.id);
+            const isRecentlyEdited =
+              editedAt !== undefined && Date.now() - editedAt < RECENT_EDIT_TTL_MS;
+            if (editedAt !== undefined && !isRecentlyEdited) {
+              recentlyEditedRef.current.delete(m.id);
+            }
             const preferredContent =
-              localContent && (!apiContent || localContent.length > apiContent.length)
+              isRecentlyEdited && localContent
+                ? localContent
+                : localContent && (!apiContent || localContent.length > apiContent.length)
                 ? localContent
                 : apiContent;
 
@@ -2279,6 +2301,12 @@ export default function AgentOrchestrator() {
       );
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
+      // Mark the regenerated agent message as recently-edited so the
+      // polling-refetch merge keeps our authoritative response instead of
+      // potentially clobbering it with a stale read (see merge useEffect).
+      if (data?.agent_message?.id) {
+        recentlyEditedRef.current.set(String(data.agent_message.id), Date.now());
+      }
       // 3. Apply server-returned content for both updated messages
       setMessages((prev) =>
         prev.map((m) => {
