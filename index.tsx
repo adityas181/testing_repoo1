@@ -2301,19 +2301,22 @@ export default function AgentOrchestrator() {
       );
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
-      // Image-edit carve-out: when the prior reply was an image, both the
-      // user message (e.g. "cat" → "dog", same length) and the regenerated
-      // agent reply (image URLs of identical length) can fall victim to
-      // the merge's length heuristic and get clobbered by a stale polling
-      // read. Tag both ids so the merge keeps our authoritative response.
-      // Non-image edits are not tagged — their length heuristic already
-      // works, and we don't want to touch flows that were already correct.
-      if (priorWasImage) {
+      // MiBuddy-only carve-out: in model-direct mode (No Agent), the
+      // polling-refetch merge's length heuristic can clobber the just-
+      // applied edit response with a stale read when new and old content
+      // are similar lengths — happens both for image URL edits (identical
+      // format) and for text edits where the regenerated essay/answer is
+      // close in length to the original.
+      // Tag the regenerated agent message + (for image edits) the user
+      // message so the merge keeps our authoritative local content.
+      // Agent-mode edits are NOT tagged — that flow has its own behavior
+      // we don't want to touch.
+      if (noAgentMode) {
         const editedAt = Date.now();
         if (data?.agent_message?.id) {
           recentlyEditedRef.current.set(String(data.agent_message.id), editedAt);
         }
-        if (data?.user_message?.id) {
+        if (priorWasImage && data?.user_message?.id) {
           recentlyEditedRef.current.set(String(data.user_message.id), editedAt);
         }
       }
