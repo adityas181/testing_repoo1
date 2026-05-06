@@ -37,6 +37,9 @@ import useAlertStore from "@/stores/alertStore";
 import shareTeamsIcon from "@/assets/share_teams.png";
 import outlookIcon from "@/assets/icons8-outlook-48.png";
 import openaiLogo from "@/assets/openai_logo.svg";
+import openaiLightLogo from "@/assets/openai_light.jfif";
+import grokLogoLight from "@/assets/grok_logo_light.svg";
+import { useDarkStore } from "@/stores/darkStore";
 import geminiLogo from "@/assets/gemini_logo.svg";
 import mistralLogo from "@/assets/mistral_logo.svg";
 import claudeLogo from "@/assets/claude_logo.svg";
@@ -837,8 +840,16 @@ function ThinkingIndicator({
 
 /* ------------------ COMPONENT ------------------ */
 
+function resolveDisplayIcon(icon: string, isDark: boolean): string {
+  if (!isDark) return icon;
+  if (icon === openaiLogo) return openaiLightLogo;
+  if (icon === grokLogo) return grokLogoLight;
+  return icon;
+}
+
 export default function AgentOrchestrator() {
   const { t } = useTranslation();
+  const isDark = useDarkStore((state) => state.dark);
   const { permissions } = useContext(AuthContext);
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
@@ -2187,6 +2198,7 @@ export default function AgentOrchestrator() {
 
     // 1. Optimistic update: set user msg text to edited value, mark agent msg
     // as "thinking" (empty content) and truncate anything after the pair.
+    let editingAgentMsgId: string | null = null;
     setMessages((prev) => {
       const userIdx = prev.findIndex((m) => m.id === msgIdBeingEdited);
       if (userIdx === -1) return prev;
@@ -2204,6 +2216,7 @@ export default function AgentOrchestrator() {
       updated[userIdx] = { ...updated[userIdx], content: text };
       // Reset agent response to empty to show "Thinking..." state (if it exists)
       if (agentIdx !== -1) {
+        editingAgentMsgId = updated[agentIdx].id;
         updated[agentIdx] = {
           ...updated[agentIdx],
           content: "",
@@ -2213,6 +2226,10 @@ export default function AgentOrchestrator() {
       }
       return updated;
     });
+    // Scope the ThinkingIndicator to this exact agent bubble. Without this,
+    // the render-loop's `msg.id === streamingMsgId` guard would fail and the
+    // empty bubble would render the "Message empty." fallback.
+    if (editingAgentMsgId) setStreamingMsgId(editingAgentMsgId);
 
     // 2. Call PUT endpoint to do the in-place update on the backend
     try {
@@ -2306,6 +2323,7 @@ export default function AgentOrchestrator() {
       setIsSending(false);
       setSendingSessionId(null);
       setRoutedMode(null);
+      setStreamingMsgId(null);
     }
   }, [editDraft, editingMsgId, cotReasoning, imageMode]);
 
@@ -3468,89 +3486,7 @@ export default function AgentOrchestrator() {
             <SidebarMaskIcon src={miHelpIcon} />
             {sidebarOpen && <span>{t("Help")}</span>}
           </button>
-          {!sidebarOpen && (
-            <div data-agents-popover className="relative mt-0.5 flex justify-center">
-              <button
-                onClick={(e) => {
-                  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-                  const popoverHeight = 320;
-                  const margin = 12;
-                  const top = Math.max(
-                    margin,
-                    Math.min(rect.top, window.innerHeight - popoverHeight - margin),
-                  );
-                  setAgentsPopoverPos({ top, left: rect.right + 8 });
-                  setShowAgentsPopover(!showAgentsPopover);
-                }}
-                className="flex items-center justify-center rounded-lg p-2 text-muted-foreground hover:bg-accent hover:text-foreground"
-                title={t("Agents")}
-              >
-                <Bot size={18} />
-              </button>
-            </div>
-          )}
         </div>
-
-        {/* Agents Panel — no internal scroll; participates in the single
-            sidebar scroll defined by the parent wrapper. */}
-        {sidebarOpen && (
-        <div className="flex shrink-0 flex-col border-t border-border">
-          <div className="shrink-0 px-4 pb-2 pt-3 text-xxs font-semibold uppercase tracking-wide text-muted-foreground">
-            {t("Agents")}
-          </div>
-          <div className="px-2 pb-2">
-            <div
-                          className="flex max-h-[11.25rem] flex-col gap-0.5 overflow-y-auto scroll-smooth"
-                          style={{ scrollbarWidth: "thin" }}
-                        >
-                          {agents.map((agent) => (
-                <button
-                  key={agent.id}
-                  onClick={() => {
-                    setSelectedModelId(agent.id);
-                    setShowModelPicker(false);
-                  }}
-                  className={`flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left text-[13px] text-foreground hover:bg-accent ${
-                    selectedModelId === agent.id ? "bg-accent" : ""
-                  }`}
-                  title={agent.name}
-                >
-                  <span
-                    className="h-2 w-2 shrink-0 rounded-full"
-                    style={{ background: agent.online ? agent.color : undefined }}
-                  />
-                  <span className="flex min-w-0 items-center">
-                    <span className="truncate">{agent.name}</span>
-                    {versionBadge(agent.version_label)}
-                    {uatBadge(agent.environment)}
-                  </span>
-                </button>
-              ))}
-              {hiddenAgentsCount > 0 && (
-                <button
-                  data-agents-popover
-                  onClick={(e) => {
-                    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-                    const popoverHeight = 320;
-                    const margin = 12;
-                    const top = Math.max(
-                      margin,
-                      Math.min(rect.top - 8, window.innerHeight - popoverHeight - margin),
-                    );
-                    setAgentsPopoverPos({ top, left: rect.right + 8 });
-                    setShowAgentsPopover(true);
-                  }}
-                  className="mt-0.5 flex w-full items-center justify-between rounded-lg px-2 py-2 text-left text-[13px] text-muted-foreground hover:bg-accent hover:text-foreground"
-                  title={t("Show more agents")}
-                >
-                  <span>{t("More")}</span>
-                  <span className="text-xxs">+{hiddenAgentsCount}</span>
-                </button>
-              )}
-            </div>
-          </div>
-        </div>
-        )}
         </div>
       </div>
 
@@ -4165,7 +4101,7 @@ export default function AgentOrchestrator() {
             >
               {headerDisplayIcon ? (
                 <img
-                  src={headerDisplayIcon}
+                  src={resolveDisplayIcon(headerDisplayIcon, isDark)}
                   alt=""
                   className="h-4 w-4 shrink-0 object-contain"
                 />
@@ -4202,7 +4138,7 @@ export default function AgentOrchestrator() {
                     }`}
                   >
                     <img
-                      src={model.icon}
+                      src={resolveDisplayIcon(model.icon, isDark)}
                       alt=""
                       className={`h-5 w-5 shrink-0 object-contain ${!noAgentMode ? "opacity-30" : ""}`}
                     />
@@ -4248,7 +4184,7 @@ export default function AgentOrchestrator() {
                           }`}
                         >
                           <img
-                            src={model.icon}
+                            src={resolveDisplayIcon(model.icon, isDark)}
                             alt=""
                             className="h-5 w-5 shrink-0 object-contain"
                           />
@@ -4301,11 +4237,17 @@ export default function AgentOrchestrator() {
               // that placeholder text would unmount the ThinkingIndicator (and its
               // image skeleton) the instant streaming begins. Keep showing the
               // indicator until real image markdown ("![...](...)") appears.
+              // Scope to the currently-streaming message — routedMode is global,
+              // so without `msg.id === streamingMsgId` an in-flight image_gen send
+              // would retroactively flip prior plain-text replies into the image
+              // skeleton state and hide their real content.
               const hasImageMarkdown = !!msg.content && msg.content.includes("![");
+              const isCurrentlyStreaming = msg.id === streamingMsgId;
               const isImageGenStreaming =
-                routedMode === "image_gen" && !hasImageMarkdown;
+                isCurrentlyStreaming && routedMode === "image_gen" && !hasImageMarkdown;
               const isThinking =
                 msg.sender === "agent" &&
+                isCurrentlyStreaming &&
                 (msg.content === "" || isImageGenStreaming) &&
                 !hasContentBlocks &&
                 !hasReasoning &&
@@ -4361,7 +4303,7 @@ export default function AgentOrchestrator() {
                   >
                     {matchedModel?.icon ? (
                       <img
-                        src={matchedModel.icon}
+                        src={resolveDisplayIcon(matchedModel.icon, isDark)}
                         alt=""
                         className="h-5 w-5 object-contain"
                       />
