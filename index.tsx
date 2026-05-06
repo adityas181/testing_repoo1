@@ -2301,11 +2301,21 @@ export default function AgentOrchestrator() {
       );
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
-      // Mark the regenerated agent message as recently-edited so the
-      // polling-refetch merge keeps our authoritative response instead of
-      // potentially clobbering it with a stale read (see merge useEffect).
-      if (data?.agent_message?.id) {
-        recentlyEditedRef.current.set(String(data.agent_message.id), Date.now());
+      // Image-edit carve-out: when the prior reply was an image, both the
+      // user message (e.g. "cat" → "dog", same length) and the regenerated
+      // agent reply (image URLs of identical length) can fall victim to
+      // the merge's length heuristic and get clobbered by a stale polling
+      // read. Tag both ids so the merge keeps our authoritative response.
+      // Non-image edits are not tagged — their length heuristic already
+      // works, and we don't want to touch flows that were already correct.
+      if (priorWasImage) {
+        const editedAt = Date.now();
+        if (data?.agent_message?.id) {
+          recentlyEditedRef.current.set(String(data.agent_message.id), editedAt);
+        }
+        if (data?.user_message?.id) {
+          recentlyEditedRef.current.set(String(data.user_message.id), editedAt);
+        }
       }
       // 3. Apply server-returned content for both updated messages
       setMessages((prev) =>
