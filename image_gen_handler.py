@@ -61,6 +61,45 @@ def is_image_modification_request(prompt: str, has_previous_image: bool) -> bool
     return has_modifier or has_pronoun
 
 
+async def session_has_recent_image(session_id: str) -> bool:
+    """Cheap check: does the latest assistant message in the session contain image markdown?
+
+    Lexical-only — does not download bytes. Used by the orchestrator routing
+    layer to short-circuit ambiguous edit requests ("replace human with robot")
+    into the image_gen path before the stateless intent classifier mis-labels
+    them as general_chat.
+    """
+    import re
+    try:
+        from sqlmodel import select
+        from agentcore.services.deps import session_scope
+        from agentcore.services.database.models.orch_conversation.model import OrchConversationTable
+    except Exception as e:
+        logger.debug(f"[ImageGen] Could not import DB deps for image presence check: {e}")
+        return False
+
+    try:
+        async with session_scope() as db:
+            stmt = (
+                select(OrchConversationTable)
+                .where(
+                    OrchConversationTable.session_id == session_id,
+                    OrchConversationTable.sender.in_(("agent", "model")),
+                )
+                .order_by(OrchConversationTable.timestamp.desc())
+                .limit(1)
+            )
+            row = (await db.exec(stmt)).first()
+    except Exception as e:
+        logger.debug(f"[ImageGen] session_has_recent_image query failed: {e}")
+        return False
+
+    if not row:
+        return False
+    text = getattr(row, "text", "") or ""
+    return bool(re.search(r"!\[[^\]]*\]\([^)]+\)", text))
+
+
 async def _get_last_generated_image(session_id: str, user_id: str) -> bytes | None:
     """Fetch the most recent AI-generated image from the session as raw bytes.
 
@@ -122,18 +161,33 @@ async def _get_last_generated_image(session_id: str, user_id: str) -> bytes | No
                 continue
 
         # Case 2: auth-proxied URL served by agentcore (/api/files/images/...)
-        # The file path format is {user_id}/generated-images/{filename}. Read
-        # directly from MiBuddy blob storage to avoid a self-HTTP call.
+        # URL shapes in the wild:
+        #   /api/files/images/{user_id}/{filename}                  ← returned by _save_generated_image
+        #     (subfolder implicit = "generated-images")
+        #   /api/files/images/{user_id}/generated-images/{filename} ← gallery listing format
+        #   /api/orchestrator/images/{user_id}/{subfolder}/{filename}
+        # We try the literal path first, then retry with the "generated-images"
+        # subfolder inserted (covers the _save_generated_image shape).
         if "/api/files/images/" in url or "/orchestrator/images/" in url:
-            try:
-                from agentcore.services.mibuddy.docqa_storage import get_file_by_path
-                # Extract path after "/images/"
-                parts = url.split("/images/", 1)
-                if len(parts) == 2:
-                    storage_path = parts[1].split("?", 1)[0]  # strip query string
-                    return await get_file_by_path(storage_path)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"[ImageGen] Failed to read from storage: {exc}")
+            from agentcore.services.mibuddy.docqa_storage import get_file_by_path
+            parts = url.split("/images/", 1)
+            if len(parts) == 2:
+                raw_path = parts[1].split("?", 1)[0]  # strip query string
+                # Try literal path first (matches gallery URLs that already include subfolder)
+                try:
+                    return await get_file_by_path(raw_path)
+                except Exception as exc1:  # noqa: BLE001
+                    logger.debug(f"[ImageGen] Direct path '{raw_path}' failed: {exc1}")
+                # Retry with generated-images subfolder injected between user_id
+                # and filename (covers _save_generated_image's 2-segment URL).
+                path_parts = raw_path.split("/")
+                if len(path_parts) == 2:
+                    retry_path = f"{path_parts[0]}/generated-images/{path_parts[1]}"
+                    try:
+                        logger.info(f"[ImageGen] Retrying with generated-images subfolder: {retry_path}")
+                        return await get_file_by_path(retry_path)
+                    except Exception as exc2:  # noqa: BLE001
+                        logger.warning(f"[ImageGen] Retry '{retry_path}' also failed: {exc2}")
                 continue
 
         # Case 3: public/SAS blob URL — fetch over HTTP
